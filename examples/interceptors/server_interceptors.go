@@ -89,6 +89,10 @@ func MetadataInterceptor(ctx gorums.ServerCtx, in *gorums.Message, next gorums.H
 // in the provided configuration. It uses message ID tracking to prevent broadcast loops -
 // each unique message (identified by its message ID) is only broadcasted once per server.
 //
+// Type Parameters:
+//   - Req: The request message type (e.g., *proto.WriteRequest)
+//   - Resp: The response message type (e.g., *proto.WriteResponse)
+//
 // Parameters:
 //   - cfg: Configuration containing the nodes to broadcast to
 //   - method: The RPC method name to invoke on other nodes (e.g., "proto.Storage.WriteRPC")
@@ -112,9 +116,9 @@ func MetadataInterceptor(ctx gorums.ServerCtx, in *gorums.Message, next gorums.H
 //
 //	// Create server with broadcast interceptor
 //	srv := gorums.NewServer(gorums.WithInterceptors(
-//	    interceptors.NewBroadcastInterceptor(clientCfg, "proto.Storage.WriteRPC"),
+//	    interceptors.NewBroadcastInterceptor[*proto.WriteRequest, *proto.WriteResponse](clientCfg, "proto.Storage.WriteRPC"),
 //	))
-func NewBroadcastInterceptor(cfg gorums.Configuration, method string) gorums.Interceptor {
+func NewBroadcastInterceptor[Req, Resp proto.Message](cfg gorums.Configuration, method string) gorums.Interceptor {
 	// Cache of message content hashes we've already broadcast (to prevent loops)
 	// We use content hash instead of message seq number because each RPCCall creates a new seq number
 	var mu sync.Mutex
@@ -128,7 +132,7 @@ func NewBroadcastInterceptor(cfg gorums.Configuration, method string) gorums.Int
 
 		// Create a unique hash from the message content
 		// This ensures we detect duplicates even when sequence numbers differ
-		msgBytes, err := proto.Marshal(msg.GetProtoMessage())
+		msgBytes, err := proto.Marshal(msg.Msg)
 		if err != nil {
 			log.Printf("BroadcastInterceptor: Failed to marshal message: %v", err)
 			return next(ctx, msg)
@@ -170,7 +174,13 @@ func NewBroadcastInterceptor(cfg gorums.Configuration, method string) gorums.Int
 			defer cancel()
 
 			// Clone the message to avoid data races
-			msgCopy := proto.Clone(msg.GetProtoMessage())
+			// Type assert to the specific request type
+			req, ok := msg.Msg.(Req)
+			if !ok {
+				log.Printf("BroadcastInterceptor: Failed to type assert message to request type")
+				return
+			}
+			msgCopy := proto.Clone(req).(Req)
 
 			// Broadcast to all nodes
 			var wg sync.WaitGroup
@@ -180,8 +190,8 @@ func NewBroadcastInterceptor(cfg gorums.Configuration, method string) gorums.Int
 					defer wg.Done()
 					nodeCtx := n.Context(broadcastCtx)
 
-					// Send the message using gorums.RPCCall
-					_, _ = gorums.RPCCall(nodeCtx, msgCopy, method)
+					// Send the message using gorums.RPCCall with proper types
+					_, _ = gorums.RPCCall[Req, Resp](nodeCtx, msgCopy, method)
 					// Silently ignore errors
 				}(node)
 			}
@@ -197,6 +207,10 @@ func NewBroadcastInterceptor(cfg gorums.Configuration, method string) gorums.Int
 // SelectiveBroadcastInterceptor creates an interceptor that conditionally broadcasts based
 // on a predicate function. This allows fine-grained control over which requests get broadcasted.
 //
+// Type Parameters:
+//   - Req: The request message type (e.g., *proto.WriteRequest)
+//   - Resp: The response message type (e.g., *proto.WriteResponse)
+//
 // Parameters:
 //   - cfg: Configuration containing the nodes to broadcast to
 //   - method: The RPC method name to invoke on other nodes
@@ -205,7 +219,7 @@ func NewBroadcastInterceptor(cfg gorums.Configuration, method string) gorums.Int
 // Example:
 //
 //	// Only broadcast writes to keys starting with "replicate:"
-//	interceptor := interceptors.NewSelectiveBroadcastInterceptor(
+//	interceptor := interceptors.NewSelectiveBroadcastInterceptor[*proto.WriteRequest, *proto.WriteResponse](
 //	    clientCfg,
 //	    "proto.Storage.WriteRPC",
 //	    func(msg proto.Message) bool {
@@ -215,10 +229,10 @@ func NewBroadcastInterceptor(cfg gorums.Configuration, method string) gorums.Int
 //	        return false
 //	    },
 //	)
-func NewSelectiveBroadcastInterceptor(cfg gorums.Configuration, method string, shouldBroadcast func(proto.Message) bool) gorums.Interceptor {
+func NewSelectiveBroadcastInterceptor[Req, Resp proto.Message](cfg gorums.Configuration, method string, shouldBroadcast func(proto.Message) bool) gorums.Interceptor {
 	return func(ctx gorums.ServerCtx, msg *gorums.Message, next gorums.Handler) (*gorums.Message, error) {
 		// Check if we should broadcast this message
-		if msg.GetMethod() != method || !shouldBroadcast(msg.GetProtoMessage()) {
+		if msg.GetMethod() != method || !shouldBroadcast(msg.Msg) {
 			return next(ctx, msg)
 		}
 
@@ -232,7 +246,13 @@ func NewSelectiveBroadcastInterceptor(cfg gorums.Configuration, method string, s
 			broadcastCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			msgCopy := proto.Clone(msg.GetProtoMessage())
+			// Type assert to the specific request type
+			req, ok := msg.Msg.(Req)
+			if !ok {
+				log.Printf("SelectiveBroadcastInterceptor: Failed to type assert message to request type")
+				return
+			}
+			msgCopy := proto.Clone(req).(Req)
 
 			var wg sync.WaitGroup
 			for _, node := range cfg.Nodes() {
@@ -240,7 +260,7 @@ func NewSelectiveBroadcastInterceptor(cfg gorums.Configuration, method string, s
 				go func(n *gorums.Node) {
 					defer wg.Done()
 					nodeCtx := n.Context(broadcastCtx)
-					_, callErr := gorums.RPCCall(nodeCtx, msgCopy, method)
+					_, callErr := gorums.RPCCall[Req, Resp](nodeCtx, msgCopy, method)
 					if callErr != nil {
 						log.Printf("SelectiveBroadcastInterceptor: Failed to broadcast to %s: %v", n.Address(), callErr)
 					} else {

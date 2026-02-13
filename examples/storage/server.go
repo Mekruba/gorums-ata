@@ -55,7 +55,7 @@ func startServerWithBroadcast(address string, otherNodes []string) (*gorums.Serv
 
 		// Add broadcast interceptor for WriteRPC method
 		// Uses message ID tracking to prevent loops
-		broadcastInterceptor := interceptors.NewBroadcastInterceptor(clientCfg, "proto.Storage.WriteRPC")
+		broadcastInterceptor := interceptors.NewBroadcastInterceptor[*pb.WriteRequest, *pb.WriteResponse](clientCfg, "proto.Storage.WriteRPC")
 		interceptorChain = append(interceptorChain, broadcastInterceptor)
 		storage.logger.Printf("Broadcast interceptor added for WriteRPC to %d nodes\n", len(otherNodes))
 	}
