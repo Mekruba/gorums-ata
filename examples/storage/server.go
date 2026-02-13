@@ -13,10 +13,16 @@ import (
 	"github.com/relab/gorums"
 	"github.com/relab/gorums/examples/interceptors"
 	pb "github.com/relab/gorums/examples/storage/proto"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func startServer(address string) (*gorums.Server, string) {
+	return startServerWithBroadcast(address, nil)
+}
+
+func startServerWithBroadcast(address string, otherNodes []string) (*gorums.Server, string) {
 	// listen on given address
 	lis, err := net.Listen("tcp", address)
 	if err != nil {
@@ -26,12 +32,36 @@ func startServer(address string) (*gorums.Server, string) {
 	storage := newStorageServer()
 	storage.logger = log.New(os.Stderr, fmt.Sprintf("%s: ", lis.Addr()), log.Ltime|log.Lmicroseconds|log.Lmsgprefix)
 
-	// create Gorums server
-	srv := gorums.NewServer(gorums.WithInterceptors(
+	// Build interceptor chain
+	interceptorChain := []gorums.Interceptor{
 		interceptors.LoggingSimpleInterceptor,
 		interceptors.NoFooAllowedInterceptor[*pb.WriteRequest],
 		interceptors.MetadataInterceptor,
-	))
+	}
+
+	// If other nodes are provided, add broadcast interceptor
+	if len(otherNodes) > 0 {
+		storage.logger.Printf("Creating broadcast interceptor for %d nodes\n", len(otherNodes))
+		// Create client manager to broadcast to other nodes
+		clientMgr := pb.NewManager(
+			gorums.WithDialOptions(
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+			),
+		)
+		clientCfg, err := pb.NewConfiguration(clientMgr, gorums.WithNodeList(otherNodes))
+		if err != nil {
+			storage.logger.Fatalf("Failed to create client configuration: %v\n", err)
+		}
+
+		// Add broadcast interceptor for WriteRPC method
+		// Uses message ID tracking to prevent loops
+		broadcastInterceptor := interceptors.NewBroadcastInterceptor(clientCfg, "proto.Storage.WriteRPC")
+		interceptorChain = append(interceptorChain, broadcastInterceptor)
+		storage.logger.Printf("Broadcast interceptor added for WriteRPC to %d nodes\n", len(otherNodes))
+	}
+
+	// create Gorums server with interceptors
+	srv := gorums.NewServer(gorums.WithInterceptors(interceptorChain...))
 	// register server implementation with Gorums server
 	pb.RegisterStorageServer(srv, storage)
 	// handle requests on listener

@@ -26,6 +26,9 @@ To run:
 
 ```shell
 ./storage/storage
+
+# Broadcast mode: writes automatically replicated to all nodes
+./storage/storage -broadcast
 ```
 
 To recompile the proto files:
