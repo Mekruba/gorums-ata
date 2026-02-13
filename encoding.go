@@ -3,225 +3,140 @@ package gorums
 import (
 	"fmt"
 
-	"github.com/relab/gorums/ordering"
+	"github.com/relab/gorums/internal/stream"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 )
 
-func init() {
-	encoding.RegisterCodec(NewCodec())
-}
-
-// ContentSubtype is the subtype used by gorums when sending messages via gRPC.
-const ContentSubtype = "gorums"
-
-type gorumsMsgType uint8
-
-const (
-	requestType gorumsMsgType = iota + 1
-	responseType
-)
-
-// Message encapsulates a protobuf message and metadata.
-//
-// This struct should be used by generated code only.
+// Message encapsulates the stream.Message and the actual proto.Message.
 type Message struct {
-	metadata *ordering.Metadata
-	message  proto.Message
-	msgType  gorumsMsgType
+	Msg proto.Message
+	*stream.Message
 }
 
-// newMessage creates a new Message struct for unmarshaling.
-// msgType specifies the message type to be unmarshaled.
-func newMessage(msgType gorumsMsgType) *Message {
-	return &Message{metadata: &ordering.Metadata{}, msgType: msgType}
-}
+// MetadataEntry is a type alias for stream.MetadataEntry.
+type MetadataEntry = stream.MetadataEntry
 
-// NewRequestMessage creates a new Gorums Message for the given metadata and request message.
+// MetadataEntry_builder is a type alias for stream.MetadataEntry_builder.
+type MetadataEntry_builder = stream.MetadataEntry_builder
+
+// NewResponseMessage creates a new response message based on the provided proto
+// message. The response message includes the message ID and method from the request
+// message to facilitate routing the response back to the caller on the client side.
+// The payload, error status, and metadata entries are left empty; the error status
+// of the response message can be set using [messageWithError], and the payload will
+// be marshaled by [ServerCtx.SendMessage]. This function is safe for concurrent use.
 //
-// This function should be used by generated code and tests only.
-func NewRequestMessage(md *ordering.Metadata, req proto.Message) *Message {
-	return &Message{metadata: md, message: req, msgType: requestType}
+// This function should only be used in generated code.
+func NewResponseMessage(in *Message, resp proto.Message) *Message {
+	if in == nil {
+		return nil
+	}
+	// Create a new stream.Message to avoid race conditions when the sender
+	// goroutine marshals while the handler creates the next response.
+	// This can happen for stream-based quorum calls where the handler can
+	// call SendMessage multiple times before returning.
+	msgBuilder := stream.Message_builder{
+		MessageSeqNo: in.GetMessageSeqNo(), // needed in channel.routeResponse to lookup the response channel
+		Method:       in.GetMethod(),       // needed in unmarshalResponse to look up the response type in the proto registry
+		// Payload is left empty; SendMessage will marshal resp into the payload when sending the message
+		// Status is left empty; it can be set by messageWithError if needed
+	}
+	return &Message{
+		Msg:     resp,
+		Message: msgBuilder.Build(),
+	}
 }
 
-// NewResponseMessage creates a new Gorums Message for the given metadata and response message.
-//
-// This function should be used by generated code only.
-func NewResponseMessage(md *ordering.Metadata, resp proto.Message) *Message {
-	return &Message{metadata: md, message: resp, msgType: responseType}
-}
-
-// AsProto returns msg's underlying protobuf message of the specified type T.
-// If msg is nil or the contained message is not of type T, the zero value of T is returned.
+// AsProto returns the message's already-decoded proto message as type T.
+// If the message is nil, or the underlying message cannot be asserted to T,
+// the zero value of T is returned.
 func AsProto[T proto.Message](msg *Message) T {
 	var zero T
-	if msg == nil || msg.message == nil {
+	if msg == nil || msg.Msg == nil {
 		return zero
 	}
-	if req, ok := msg.message.(T); ok {
+	if req, ok := msg.Msg.(T); ok {
 		return req
 	}
 	return zero
 }
 
-// GetProtoMessage returns the protobuf message contained in the Message.
-func (m *Message) GetProtoMessage() proto.Message {
-	if m == nil {
-		return nil
+// messageWithError ensures a response message exists and sets the error status.
+// If out is nil, a new response message is created based on the in request message;
+// otherwise, out is modified in place. This is used by the server to send error
+// responses back to the client.
+func messageWithError(in, out *Message, err error) *Message {
+	if out == nil {
+		out = NewResponseMessage(in, nil)
 	}
-	return m.message
-}
-
-// GetMetadata returns the metadata of the message.
-func (m *Message) GetMetadata() *ordering.Metadata {
-	if m == nil {
-		return nil
-	}
-	return m.metadata
-}
-
-// GetMethod returns the method name from the message metadata.
-func (m *Message) GetMethod() string {
-	if m == nil {
-		return "nil"
-	}
-	return m.metadata.GetMethod()
-}
-
-// GetMessageID returns the message ID from the message metadata.
-func (m *Message) GetMessageID() uint64 {
-	if m == nil {
-		return 0
-	}
-	return m.metadata.GetMessageSeqNo()
-}
-
-func (m *Message) GetStatus() *status.Status {
-	if m == nil {
-		return status.New(codes.Unknown, "nil message")
-	}
-	return status.FromProto(m.metadata.GetStatus())
-}
-
-// setError sets the error status in the message metadata in preparation for sending
-// the response to the client. The provided error may include several wrapped errors.
-// If err is nil, the status is set to OK.
-// This method should be called just prior to sending the response to the client.
-func (m *Message) setError(err error) {
-	errStatus, ok := status.FromError(err)
-	if !ok {
-		errStatus = status.New(codes.Unknown, err.Error())
-	}
-	m.metadata.SetStatus(errStatus.Proto())
-}
-
-// Codec is the gRPC codec used by gorums.
-type Codec struct {
-	marshaler   proto.MarshalOptions
-	unmarshaler proto.UnmarshalOptions
-}
-
-// NewCodec returns a new Codec.
-func NewCodec() *Codec {
-	return &Codec{
-		marshaler:   proto.MarshalOptions{AllowPartial: true},
-		unmarshaler: proto.UnmarshalOptions{AllowPartial: true},
-	}
-}
-
-// Name returns the name of the Codec.
-func (Codec) Name() string {
-	return ContentSubtype
-}
-
-func (Codec) String() string {
-	return ContentSubtype
-}
-
-// Marshal marshals the message m into a byte slice.
-func (c Codec) Marshal(m any) (b []byte, err error) {
-	switch msg := m.(type) {
-	case *Message:
-		return c.gorumsMarshal(msg)
-	case proto.Message:
-		return c.marshaler.Marshal(msg)
-	default:
-		return nil, fmt.Errorf("gorums: cannot marshal message of type '%T'", m)
-	}
-}
-
-// gorumsMarshal marshals a metadata and a data message into a single byte slice.
-func (c Codec) gorumsMarshal(msg *Message) (b []byte, err error) {
-	mdSize := c.marshaler.Size(msg.metadata)
-	b = protowire.AppendVarint(b, uint64(mdSize))
-	b, err = c.marshaler.MarshalAppend(b, msg.metadata)
 	if err != nil {
-		return nil, err
+		errStatus, ok := status.FromError(err)
+		if !ok {
+			errStatus = status.New(codes.Unknown, err.Error())
+		}
+		out.SetStatus(errStatus.Proto())
 	}
-
-	msgSize := c.marshaler.Size(msg.message)
-	b = protowire.AppendVarint(b, uint64(msgSize))
-	b, err = c.marshaler.MarshalAppend(b, msg.message)
-	if err != nil {
-		return nil, err
-	}
-	return b, nil
+	return out
 }
 
-// Unmarshal unmarshals a byte slice into m.
-func (c Codec) Unmarshal(b []byte, m any) (err error) {
-	switch msg := m.(type) {
-	case *Message:
-		return c.gorumsUnmarshal(b, msg)
-	case proto.Message:
-		return c.unmarshaler.Unmarshal(b, msg)
-	default:
-		return fmt.Errorf("gorums: cannot unmarshal message of type '%T'", m)
-	}
-}
-
-// gorumsUnmarshal extracts metadata and message data from b and places the result in msg.
-func (c Codec) gorumsUnmarshal(b []byte, msg *Message) (err error) {
-	// unmarshal metadata
-	mdBuf, mdLen := protowire.ConsumeBytes(b)
-	err = c.unmarshaler.Unmarshal(mdBuf, msg.metadata)
-	if err != nil {
-		return fmt.Errorf("gorums: could not unmarshal metadata: %w", err)
-	}
-
+// unmarshalRequest unmarshals the request proto message from the message.
+// It uses the method name in the message to look up the Input type from the proto registry.
+//
+// This function should only be used by internal channel operations.
+func unmarshalRequest(in *stream.Message) (proto.Message, error) {
 	// get method descriptor from registry
-	desc, err := protoregistry.GlobalFiles.FindDescriptorByName(protoreflect.FullName(msg.GetMethod()))
+	desc, err := protoregistry.GlobalFiles.FindDescriptorByName(protoreflect.FullName(in.GetMethod()))
 	if err != nil {
-		// err is a NotFound error with no method name information; return a more informative error
-		return fmt.Errorf("gorums: could not find method descriptor for %s", msg.GetMethod())
+		return nil, fmt.Errorf("gorums: could not find method descriptor for %s", in.GetMethod())
 	}
 	methodDesc := desc.(protoreflect.MethodDescriptor)
 
-	// get message name depending on whether we are creating a request or response message
-	var messageName protoreflect.FullName
-	switch msg.msgType {
-	case requestType:
-		messageName = methodDesc.Input().FullName()
-	case responseType:
-		messageName = methodDesc.Output().FullName()
-	default:
-		return fmt.Errorf("gorums: unknown message type %d", msg.msgType)
-	}
-
-	// now get the message type from the types registry
-	msgType, err := protoregistry.GlobalTypes.FindMessageByName(messageName)
+	// get the request message type (Input type)
+	msgType, err := protoregistry.GlobalTypes.FindMessageByName(methodDesc.Input().FullName())
 	if err != nil {
-		// err is a NotFound error with no message name information; return a more informative error
-		return fmt.Errorf("gorums: could not find message type %s", messageName)
+		return nil, fmt.Errorf("gorums: could not find message type %s", methodDesc.Input().FullName())
 	}
-	msg.message = msgType.New().Interface()
+	req := msgType.New().Interface()
 
-	// unmarshal message
-	msgBuf, _ := protowire.ConsumeBytes(b[mdLen:])
-	return c.unmarshaler.Unmarshal(msgBuf, msg.message)
+	// unmarshal message from the Message.Payload field
+	payload := in.GetPayload()
+	if len(payload) > 0 {
+		if err := proto.Unmarshal(payload, req); err != nil {
+			return nil, fmt.Errorf("gorums: could not unmarshal request: %w", err)
+		}
+	}
+	return req, nil
+}
+
+// unmarshalResponse unmarshals the response proto message from the message.
+// It uses the method name in the message to look up the Output type from the proto registry.
+//
+// This function should only be used by internal channel operations.
+func unmarshalResponse(out *stream.Message) (proto.Message, error) {
+	// get method descriptor from registry
+	desc, err := protoregistry.GlobalFiles.FindDescriptorByName(protoreflect.FullName(out.GetMethod()))
+	if err != nil {
+		return nil, fmt.Errorf("gorums: could not find method descriptor for %s", out.GetMethod())
+	}
+	methodDesc := desc.(protoreflect.MethodDescriptor)
+
+	// get the response message type (Output type)
+	msgType, err := protoregistry.GlobalTypes.FindMessageByName(methodDesc.Output().FullName())
+	if err != nil {
+		return nil, fmt.Errorf("gorums: could not find message type %s", methodDesc.Output().FullName())
+	}
+	resp := msgType.New().Interface()
+
+	// unmarshal message from the Message.Payload field
+	payload := out.GetPayload()
+	if len(payload) > 0 {
+		if err := proto.Unmarshal(payload, resp); err != nil {
+			return nil, fmt.Errorf("gorums: could not unmarshal response: %w", err)
+		}
+	}
+	return resp, nil
 }

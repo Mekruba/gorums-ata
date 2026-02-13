@@ -5,12 +5,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/relab/gorums/ordering"
+	"github.com/relab/gorums/internal/stream"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/proto"
 )
 
 // NodeResponse wraps a response value from node ID, and an error if any.
@@ -45,10 +44,10 @@ var (
 
 type request struct {
 	ctx          context.Context
-	msg          *Message
-	waitSendDone bool
+	msg          *stream.Message
 	streaming    bool
-	responseChan chan<- NodeResponse[proto.Message]
+	waitSendDone bool
+	responseChan chan<- NodeResponse[msg]
 	sendTime     time.Time
 }
 
@@ -68,9 +67,9 @@ type channel struct {
 	latency   time.Duration
 
 	// Stream lifecycle management for FIFO ordered message delivery
-	// gorumsStream is a bidirectional stream for
-	// sending and receiving ordering.Metadata messages.
-	gorumsStream ordering.Gorums_NodeStreamClient
+	// stream is a bidirectional stream for
+	// sending and receiving stream.Message messages.
+	stream       stream.Gorums_NodeStreamClient
 	streamMut    sync.Mutex
 	streamCtx    context.Context
 	streamCancel context.CancelFunc
@@ -146,19 +145,19 @@ func (c *channel) ensureConnectedNodeStream() (err error) {
 	defer c.streamMut.Unlock()
 	// if we already have a ready connection and an active stream, do nothing
 	// (cannot reuse isConnected() here since it uses the streamMut lock)
-	if c.conn.GetState() == connectivity.Ready && c.gorumsStream != nil {
+	if c.conn.GetState() == connectivity.Ready && c.stream != nil {
 		return nil
 	}
 	c.streamCtx, c.streamCancel = context.WithCancel(c.connCtx)
-	c.gorumsStream, err = ordering.NewGorumsClient(c.conn).NodeStream(c.streamCtx)
+	c.stream, err = stream.NewGorumsClient(c.conn).NodeStream(c.streamCtx)
 	return err
 }
 
 // getStream returns the current stream, or nil if no stream is available.
-func (c *channel) getStream() grpc.ClientStream {
+func (c *channel) getStream() stream.Gorums_NodeStreamClient {
 	c.streamMut.Lock()
 	defer c.streamMut.Unlock()
-	return c.gorumsStream
+	return c.stream
 }
 
 // clearStream cancels the current stream context and clears the stream reference.
@@ -166,7 +165,7 @@ func (c *channel) getStream() grpc.ClientStream {
 func (c *channel) clearStream() {
 	c.streamMut.Lock()
 	c.streamCancel()
-	c.gorumsStream = nil
+	c.stream = nil
 	c.streamMut.Unlock()
 }
 
@@ -181,7 +180,7 @@ func (c *channel) isConnected() bool {
 func (c *channel) enqueue(req request) {
 	if req.responseChan != nil {
 		req.sendTime = time.Now()
-		msgID := req.msg.GetMessageID()
+		msgID := req.msg.GetMessageSeqNo()
 		c.responseMut.Lock()
 		c.responseRouters[msgID] = req
 		c.responseMut.Unlock()
@@ -191,7 +190,7 @@ func (c *channel) enqueue(req request) {
 	select {
 	case <-c.connCtx.Done():
 		// the node's close() method was called: respond with error instead of enqueueing
-		c.routeResponse(req.msg.GetMessageID(), NodeResponse[proto.Message]{NodeID: c.id, Err: nodeClosedErr})
+		c.routeResponse(req.msg.GetMessageSeqNo(), NodeResponse[msg]{NodeID: c.id, Err: nodeClosedErr})
 		return
 	case c.sendQ <- req:
 		// enqueued successfully
@@ -200,7 +199,7 @@ func (c *channel) enqueue(req request) {
 
 // routeResponse routes the response to the appropriate response channel based on msgID.
 // If no matching request is found, the response is discarded.
-func (c *channel) routeResponse(msgID uint64, resp NodeResponse[proto.Message]) {
+func (c *channel) routeResponse(msgID uint64, resp NodeResponse[msg]) {
 	c.responseMut.Lock()
 	defer c.responseMut.Unlock()
 	if req, ok := c.responseRouters[msgID]; ok {
@@ -221,7 +220,7 @@ func (c *channel) cancelPendingMsgs(err error) {
 	c.responseMut.Lock()
 	defer c.responseMut.Unlock()
 	for msgID, req := range c.responseRouters {
-		req.responseChan <- NodeResponse[proto.Message]{NodeID: c.id, Err: err}
+		req.responseChan <- NodeResponse[msg]{NodeID: c.id, Err: err}
 		// delete the router if we are only expecting a single reply message
 		if !req.streaming {
 			delete(c.responseRouters, msgID)
@@ -253,11 +252,11 @@ func (c *channel) sender() {
 			// take next request from sendQ
 		}
 		if err := c.ensureStream(); err != nil {
-			c.routeResponse(req.msg.GetMessageID(), NodeResponse[proto.Message]{NodeID: c.id, Err: err})
+			c.routeResponse(req.msg.GetMessageSeqNo(), NodeResponse[msg]{NodeID: c.id, Err: err})
 			continue
 		}
 		if err := c.sendMsg(req); err != nil {
-			c.routeResponse(req.msg.GetMessageID(), NodeResponse[proto.Message]{NodeID: c.id, Err: err})
+			c.routeResponse(req.msg.GetMessageSeqNo(), NodeResponse[msg]{NodeID: c.id, Err: err})
 		}
 	}
 }
@@ -280,14 +279,18 @@ func (c *channel) receiver() {
 			}
 		}
 
-		resp := newMessage(responseType)
-		if err := stream.RecvMsg(resp); err != nil {
-			c.setLastErr(err)
-			c.cancelPendingMsgs(err)
+		respMsg, e := stream.Recv()
+		if e != nil {
+			c.setLastErr(e)
+			c.cancelPendingMsgs(e)
 			c.clearStream()
 		} else {
-			err := resp.GetStatus().Err()
-			c.routeResponse(resp.GetMessageID(), NodeResponse[proto.Message]{NodeID: c.id, Value: resp.GetProtoMessage(), Err: err})
+			err := respMsg.ErrorStatus()
+			var resp msg
+			if err == nil {
+				resp, err = unmarshalResponse(respMsg)
+			}
+			c.routeResponse(respMsg.GetMessageSeqNo(), NodeResponse[msg]{NodeID: c.id, Value: resp, Err: err})
 		}
 
 		select {
@@ -317,7 +320,7 @@ func (c *channel) sendMsg(req request) (err error) {
 		// wait for actual server responses, so waitSendDone is false for them.
 		if req.waitSendDone && err == nil {
 			// Send succeeded: unblock the caller and clean up the responseRouter
-			c.routeResponse(req.msg.GetMessageID(), NodeResponse[proto.Message]{})
+			c.routeResponse(req.msg.GetMessageSeqNo(), NodeResponse[msg]{})
 		}
 	}()
 
@@ -354,7 +357,7 @@ func (c *channel) sendMsg(req request) (err error) {
 		}
 	}()
 
-	if err = stream.SendMsg(req.msg); err != nil {
+	if err = stream.Send(req.msg); err != nil {
 		c.setLastErr(err)
 		c.clearStream()
 	}

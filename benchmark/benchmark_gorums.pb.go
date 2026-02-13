@@ -46,9 +46,9 @@ func NewManager(opts ...gorums.ManagerOption) *Manager {
 }
 
 // NewConfiguration returns a configuration based on the provided list of nodes.
-// Nodes can be supplied using WithNodeMap or WithNodeList, or WithNodeIDs.
-// A new configuration can also be created from an existing configuration,
-// using the And, WithNewNodes, Except, and WithoutNodes methods.
+// Nodes can be supplied using WithNodes or WithNodeList.
+// A new configuration can also be created from an existing configuration
+// using the Add, Union, Remove, Difference, Extend, and WithoutErrors methods.
 func NewConfiguration(mgr *Manager, opt gorums.NodeListOption) (Configuration, error) {
 	return gorums.NewConfiguration(mgr, opt)
 }
@@ -168,32 +168,50 @@ func RegisterBenchmarkServer(srv *gorums.Server, impl BenchmarkServer) {
 	srv.RegisterHandler("benchmark.Benchmark.StartServerBenchmark", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*StartRequest](in)
 		resp, err := impl.StartServerBenchmark(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 	srv.RegisterHandler("benchmark.Benchmark.StopServerBenchmark", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*StopRequest](in)
 		resp, err := impl.StopServerBenchmark(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 	srv.RegisterHandler("benchmark.Benchmark.StartBenchmark", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*StartRequest](in)
 		resp, err := impl.StartBenchmark(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 	srv.RegisterHandler("benchmark.Benchmark.StopBenchmark", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*StopRequest](in)
 		resp, err := impl.StopBenchmark(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 	srv.RegisterHandler("benchmark.Benchmark.QuorumCall", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*Echo](in)
 		resp, err := impl.QuorumCall(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 	srv.RegisterHandler("benchmark.Benchmark.SlowServer", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*Echo](in)
 		resp, err := impl.SlowServer(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 	srv.RegisterHandler("benchmark.Benchmark.Multicast", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*TimedMsg](in)

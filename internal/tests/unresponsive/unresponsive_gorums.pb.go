@@ -45,9 +45,9 @@ func NewManager(opts ...gorums.ManagerOption) *Manager {
 }
 
 // NewConfiguration returns a configuration based on the provided list of nodes.
-// Nodes can be supplied using WithNodeMap or WithNodeList, or WithNodeIDs.
-// A new configuration can also be created from an existing configuration,
-// using the And, WithNewNodes, Except, and WithoutNodes methods.
+// Nodes can be supplied using WithNodes or WithNodeList.
+// A new configuration can also be created from an existing configuration
+// using the Add, Union, Remove, Difference, Extend, and WithoutErrors methods.
 func NewConfiguration(mgr *Manager, opt gorums.NodeListOption) (Configuration, error) {
 	return gorums.NewConfiguration(mgr, opt)
 }
@@ -73,12 +73,8 @@ func NewConfig(opts ...gorums.Option) (Configuration, error) {
 }
 
 // TestUnresponsive is an RPC call invoked on the node in ctx.
-func TestUnresponsive(ctx *NodeContext, in *Empty) (resp *Empty, err error) {
-	res, err := gorums.RPCCall(ctx, in, "unresponsive.Unresponsive.TestUnresponsive")
-	if err != nil {
-		return nil, err
-	}
-	return res.(*Empty), err
+func TestUnresponsive(ctx *NodeContext, in *Empty) (*Empty, error) {
+	return gorums.RPCCall[*Empty, *Empty](ctx, in, "unresponsive.Unresponsive.TestUnresponsive")
 }
 
 // Unresponsive is the server-side API for the Unresponsive Service
@@ -90,6 +86,9 @@ func RegisterUnresponsiveServer(srv *gorums.Server, impl UnresponsiveServer) {
 	srv.RegisterHandler("unresponsive.Unresponsive.TestUnresponsive", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*Empty](in)
 		resp, err := impl.TestUnresponsive(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 }

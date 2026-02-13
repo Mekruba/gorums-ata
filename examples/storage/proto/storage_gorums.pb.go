@@ -46,9 +46,9 @@ func NewManager(opts ...gorums.ManagerOption) *Manager {
 }
 
 // NewConfiguration returns a configuration based on the provided list of nodes.
-// Nodes can be supplied using WithNodeMap or WithNodeList, or WithNodeIDs.
-// A new configuration can also be created from an existing configuration,
-// using the And, WithNewNodes, Except, and WithoutNodes methods.
+// Nodes can be supplied using WithNodes or WithNodeList.
+// A new configuration can also be created from an existing configuration
+// using the Add, Union, Remove, Difference, Extend, and WithoutErrors methods.
 func NewConfiguration(mgr *Manager, opt gorums.NodeListOption) (Configuration, error) {
 	return gorums.NewConfiguration(mgr, opt)
 }
@@ -90,22 +90,14 @@ var _ emptypb.Empty
 
 // ReadRPC executes a Read RPC on a single node and
 // returns the value for the provided key.
-func ReadRPC(ctx *NodeContext, in *ReadRequest) (resp *ReadResponse, err error) {
-	res, err := gorums.RPCCall(ctx, in, "proto.Storage.ReadRPC")
-	if err != nil {
-		return nil, err
-	}
-	return res.(*ReadResponse), err
+func ReadRPC(ctx *NodeContext, in *ReadRequest) (*ReadResponse, error) {
+	return gorums.RPCCall[*ReadRequest, *ReadResponse](ctx, in, "proto.Storage.ReadRPC")
 }
 
 // WriteRPC executes a Write RPC on a single node and
 // returns true if the value was updated.
-func WriteRPC(ctx *NodeContext, in *WriteRequest) (resp *WriteResponse, err error) {
-	res, err := gorums.RPCCall(ctx, in, "proto.Storage.WriteRPC")
-	if err != nil {
-		return nil, err
-	}
-	return res.(*WriteResponse), err
+func WriteRPC(ctx *NodeContext, in *WriteRequest) (*WriteResponse, error) {
+	return gorums.RPCCall[*WriteRequest, *WriteResponse](ctx, in, "proto.Storage.WriteRPC")
 }
 
 // ReadQC executes a Read quorum call on a configuration of nodes and
@@ -145,22 +137,34 @@ func RegisterStorageServer(srv *gorums.Server, impl StorageServer) {
 	srv.RegisterHandler("proto.Storage.ReadRPC", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*ReadRequest](in)
 		resp, err := impl.ReadRPC(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 	srv.RegisterHandler("proto.Storage.WriteRPC", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*WriteRequest](in)
 		resp, err := impl.WriteRPC(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 	srv.RegisterHandler("proto.Storage.ReadQC", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*ReadRequest](in)
 		resp, err := impl.ReadQC(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 	srv.RegisterHandler("proto.Storage.WriteQC", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*WriteRequest](in)
 		resp, err := impl.WriteQC(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 	srv.RegisterHandler("proto.Storage.WriteMulticast", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*WriteRequest](in)

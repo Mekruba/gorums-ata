@@ -1,22 +1,32 @@
 package gorums
 
-import (
-	"github.com/relab/gorums/ordering"
-	"google.golang.org/protobuf/proto"
-)
+import "github.com/relab/gorums/internal/stream"
 
 // RPCCall executes a remote procedure call on the node.
 //
 // This method should be used by generated code only.
-func RPCCall(ctx *NodeContext, msg proto.Message, method string) (proto.Message, error) {
-	md := ordering.NewGorumsMetadata(ctx, ctx.nextMsgID(), method)
-	replyChan := make(chan NodeResponse[proto.Message], 1)
-	ctx.enqueue(request{ctx: ctx, msg: NewRequestMessage(md, msg), responseChan: replyChan})
+func RPCCall[Req, Resp msg](ctx *NodeContext, req Req, method string) (Resp, error) {
+	replyChan := make(chan NodeResponse[msg], 1)
+	reqMsg, err := stream.NewMessage(ctx, ctx.nextMsgID(), method, req)
+	if err != nil {
+		var zero Resp
+		return zero, err
+	}
+	ctx.enqueue(request{ctx: ctx, msg: reqMsg, responseChan: replyChan})
 
 	select {
 	case r := <-replyChan:
-		return r.Value, r.Err
+		var zero Resp
+		if r.Err != nil {
+			return zero, r.Err
+		}
+		resp, ok := r.Value.(Resp)
+		if !ok {
+			return zero, ErrTypeMismatch
+		}
+		return resp, r.Err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		var zero Resp
+		return zero, ctx.Err()
 	}
 }

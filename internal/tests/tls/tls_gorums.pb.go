@@ -45,9 +45,9 @@ func NewManager(opts ...gorums.ManagerOption) *Manager {
 }
 
 // NewConfiguration returns a configuration based on the provided list of nodes.
-// Nodes can be supplied using WithNodeMap or WithNodeList, or WithNodeIDs.
-// A new configuration can also be created from an existing configuration,
-// using the And, WithNewNodes, Except, and WithoutNodes methods.
+// Nodes can be supplied using WithNodes or WithNodeList.
+// A new configuration can also be created from an existing configuration
+// using the Add, Union, Remove, Difference, Extend, and WithoutErrors methods.
 func NewConfiguration(mgr *Manager, opt gorums.NodeListOption) (Configuration, error) {
 	return gorums.NewConfiguration(mgr, opt)
 }
@@ -73,12 +73,8 @@ func NewConfig(opts ...gorums.Option) (Configuration, error) {
 }
 
 // TestTLS is an RPC call invoked on the node in ctx.
-func TestTLS(ctx *NodeContext, in *Request) (resp *Response, err error) {
-	res, err := gorums.RPCCall(ctx, in, "tls.TLS.TestTLS")
-	if err != nil {
-		return nil, err
-	}
-	return res.(*Response), err
+func TestTLS(ctx *NodeContext, in *Request) (*Response, error) {
+	return gorums.RPCCall[*Request, *Response](ctx, in, "tls.TLS.TestTLS")
 }
 
 // TLS is the server-side API for the TLS Service
@@ -90,6 +86,9 @@ func RegisterTLSServer(srv *gorums.Server, impl TLSServer) {
 	srv.RegisterHandler("tls.TLS.TestTLS", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*Request](in)
 		resp, err := impl.TestTLS(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 }

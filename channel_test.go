@@ -9,10 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/relab/gorums/internal/stream"
 	"github.com/relab/gorums/internal/testutils/mock"
-	"github.com/relab/gorums/ordering"
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/proto"
 	pb "google.golang.org/protobuf/types/known/wrapperspb"
 )
 
@@ -36,8 +35,8 @@ func waitForConnection(node *Node, timeout time.Duration) bool {
 
 type mockSrv struct{}
 
-func (mockSrv) Test(_ ServerCtx, req proto.Message) (proto.Message, error) {
-	return pb.String(mock.GetVal(req) + "-mocked-"), nil
+func (mockSrv) Test(_ ServerCtx, req *pb.StringValue) (*pb.StringValue, error) {
+	return pb.String(req.GetValue() + "-mocked-"), nil
 }
 
 // delayServerFn returns a server function that delays responses by the given duration.
@@ -48,20 +47,28 @@ func delayServerFn(delay time.Duration) func(_ int) ServerIface {
 		srv.RegisterHandler(mock.TestMethod, func(ctx ServerCtx, in *Message) (*Message, error) {
 			// Simulate slow processing
 			time.Sleep(delay)
-			resp, err := mockSrv.Test(ctx, in.GetProtoMessage())
-			return NewResponseMessage(in.GetMetadata(), resp), err
+			req := AsProto[*pb.StringValue](in)
+			resp, err := mockSrv.Test(ctx, req)
+			if err != nil {
+				return nil, err
+			}
+			return NewResponseMessage(in, resp), nil
 		})
 		return srv
 	}
 }
 
-func sendRequest(t testing.TB, node *Node, req request, msgID uint64) NodeResponse[proto.Message] {
+func sendRequest(t testing.TB, node *Node, req request, msgID uint64) NodeResponse[msg] {
 	t.Helper()
 	if req.ctx == nil {
 		req.ctx = t.Context()
 	}
-	req.msg = NewRequestMessage(ordering.NewGorumsMetadata(req.ctx, msgID, mock.TestMethod), nil)
-	replyChan := make(chan NodeResponse[proto.Message], 1)
+	reqMsg, err := stream.NewMessage(req.ctx, msgID, mock.TestMethod, nil)
+	if err != nil {
+		t.Fatalf("NewMessage failed: %v", err)
+	}
+	req.msg = reqMsg
+	replyChan := make(chan NodeResponse[msg], 1)
 	req.responseChan = replyChan
 	node.channel.enqueue(req)
 
@@ -70,13 +77,13 @@ func sendRequest(t testing.TB, node *Node, req request, msgID uint64) NodeRespon
 		return resp
 	case <-time.After(defaultTestTimeout):
 		t.Fatalf("timeout waiting for response to message %d", msgID)
-		return NodeResponse[proto.Message]{}
+		return NodeResponse[msg]{}
 	}
 }
 
 type msgResponse struct {
 	msgID uint64
-	resp  NodeResponse[proto.Message]
+	resp  NodeResponse[msg]
 }
 
 func sendReq(t testing.TB, results chan<- msgResponse, node *Node, goroutineID, msgsToSend int, req request) {
@@ -177,7 +184,7 @@ func TestChannelSendBufferSize(t *testing.T) {
 			node := TestNode(t, EchoServerFn, WithSendBufferSize(size))
 
 			ctx := TestContext(t, time.Second)
-			_, err := RPCCall(node.Context(ctx), pb.String("test"), mock.TestMethod)
+			_, err := RPCCall[*pb.StringValue, *pb.StringValue](node.Context(ctx), pb.String("test"), mock.TestMethod)
 			if err != nil {
 				t.Errorf("RPCCall failed with buffer size %d: %v", size, err)
 			}
@@ -199,7 +206,7 @@ func TestChannelLatency(t *testing.T) {
 	// exponential weighted moving average to stabilize to the real RTT.
 	for i := range 10 {
 		ctx := TestContext(t, time.Second)
-		_, err := RPCCall(node.Context(ctx), pb.String("ping"), mock.TestMethod)
+		_, err := RPCCall[*pb.StringValue, *pb.StringValue](node.Context(ctx), pb.String("ping"), mock.TestMethod)
 		if err != nil {
 			t.Fatalf("RPCCall %d failed: %v", i, err)
 		}
@@ -594,8 +601,8 @@ func TestChannelDeadlock(t *testing.T) {
 	for id := range 10 {
 		go func() {
 			ctx := TestContext(t, 3*time.Second)
-			md := ordering.NewGorumsMetadata(ctx, uint64(100+id), mock.TestMethod)
-			req := request{ctx: ctx, msg: NewRequestMessage(md, nil)}
+			reqMsg, _ := stream.NewMessage(ctx, uint64(100+id), mock.TestMethod, nil)
+			req := request{ctx: ctx, msg: reqMsg}
 
 			// try to enqueue
 			select {
@@ -800,9 +807,9 @@ func BenchmarkChannelStreamReadyFirstRequest(b *testing.B) {
 
 		// Use a fresh context for the benchmark request
 		ctx := TestContext(b, defaultTestTimeout)
-		req := request{ctx: ctx}
-		req.msg = NewRequestMessage(ordering.NewGorumsMetadata(ctx, 1, mock.TestMethod), nil)
-		replyChan := make(chan NodeResponse[proto.Message], 1)
+		reqMsg, _ := stream.NewMessage(ctx, 1, mock.TestMethod, nil)
+		req := request{ctx: ctx, msg: reqMsg}
+		replyChan := make(chan NodeResponse[msg], 1)
 		req.responseChan = replyChan
 		node.channel.enqueue(req)
 
@@ -850,9 +857,9 @@ func BenchmarkChannelStreamReadyReconnect(b *testing.B) {
 
 	// Establish initial stream with a fresh context
 	ctx := context.Background()
-	req := request{ctx: ctx}
-	req.msg = NewRequestMessage(ordering.NewGorumsMetadata(ctx, 0, mock.TestMethod), nil)
-	replyChan := make(chan NodeResponse[proto.Message], 1)
+	reqMsg, _ := stream.NewMessage(ctx, 0, mock.TestMethod, nil)
+	req := request{ctx: ctx, msg: reqMsg}
+	replyChan := make(chan NodeResponse[msg], 1)
 	req.responseChan = replyChan
 	node.channel.enqueue(req)
 
@@ -876,9 +883,9 @@ func BenchmarkChannelStreamReadyReconnect(b *testing.B) {
 
 		// Now send a request which will trigger ensureStream -> newNodeStream -> signal
 		ctx := context.Background()
-		req := request{ctx: ctx}
-		req.msg = NewRequestMessage(ordering.NewGorumsMetadata(ctx, uint64(i+1), mock.TestMethod), nil)
-		replyChan := make(chan NodeResponse[proto.Message], 1)
+		reqMsg, _ := stream.NewMessage(ctx, uint64(i+1), mock.TestMethod, nil)
+		req := request{ctx: ctx, msg: reqMsg}
+		replyChan := make(chan NodeResponse[msg], 1)
 		req.responseChan = replyChan
 		node.channel.enqueue(req)
 

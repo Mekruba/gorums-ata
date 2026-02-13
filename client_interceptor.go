@@ -5,7 +5,7 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/relab/gorums/ordering"
+	"github.com/relab/gorums/internal/stream"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -42,7 +42,7 @@ type ClientCtx[Req, Resp msg] struct {
 	config    Configuration
 	request   Req
 	method    string
-	md        *ordering.Metadata
+	msgID     uint64
 	replyChan chan NodeResponse[msg]
 
 	// reqTransforms holds request transformation functions registered by interceptors.
@@ -51,11 +51,6 @@ type ClientCtx[Req, Resp msg] struct {
 	// responseSeq is the iterator that yields node responses.
 	// Interceptors can wrap this iterator to modify responses.
 	responseSeq ResponseSeq[Resp]
-
-	// expectedReplies is the number of responses expected from nodes.
-	// It is set when messages are sent and may be lower than config size
-	// if some nodes are skipped by request transformations.
-	expectedReplies int
 
 	// streaming indicates whether this is a streaming call (for correctable streams).
 	streaming bool
@@ -87,11 +82,10 @@ func newClientCtxBuilder[Req, Resp msg](
 ) *clientCtxBuilder[Req, Resp] {
 	return &clientCtxBuilder[Req, Resp]{
 		c: &ClientCtx[Req, Resp]{
-			Context:         ctx,
-			config:          ctx.Configuration(),
-			request:         req,
-			method:          method,
-			expectedReplies: ctx.Configuration().Size(),
+			Context: ctx,
+			config:  ctx.Configuration(),
+			request: req,
+			method:  method,
 		},
 		chanMultiplier: 1,
 	}
@@ -117,8 +111,8 @@ func (b *clientCtxBuilder[Req, Resp]) WithWaitSendDone(waitSendDone bool) *clien
 // Build finalizes the ClientCtx configuration and returns the constructed instance.
 // It creates the metadata and reply channel, and sets up the appropriate response iterator.
 func (b *clientCtxBuilder[Req, Resp]) Build() *ClientCtx[Req, Resp] {
-	// Create metadata and reply channel at build time
-	b.c.md = ordering.NewGorumsMetadata(b.c.Context, b.c.config.nextMsgID(), b.c.method)
+	// Assign a unique message ID and create the reply channel at build time.
+	b.c.msgID = b.c.config.nextMsgID()
 	b.c.replyChan = make(chan NodeResponse[msg], b.c.config.Size()*b.chanMultiplier)
 
 	if b.c.streaming {
@@ -170,23 +164,6 @@ func (c *ClientCtx[Req, Resp]) Size() int {
 	return c.config.Size()
 }
 
-// applyTransforms returns the transformed request as a proto.Message, or nil if the result is
-// invalid or the node should be skipped. It applies the registered transformation functions to
-// the given request for the specified node. Transformation functions are applied in the order
-// they were registered.
-func (c *ClientCtx[Req, Resp]) applyTransforms(req Req, node *Node) proto.Message {
-	result := req
-	for _, transform := range c.reqTransforms {
-		result = transform(result, node)
-	}
-	if protoMsg, ok := any(result).(proto.Message); ok {
-		if protoMsg.ProtoReflect().IsValid() {
-			return protoMsg
-		}
-	}
-	return nil
-}
-
 // applyInterceptors chains the given interceptors, wrapping the response sequence.
 // Each interceptor receives the current response sequence and returns a new one.
 // Interceptors are applied in order, with each wrapping the previous result.
@@ -200,25 +177,59 @@ func (c *ClientCtx[Req, Resp]) applyInterceptors(interceptors []any) {
 }
 
 // send dispatches requests to all nodes, applying any registered transformations.
-// It updates expectedReplies based on how many nodes actually receive requests
-// (nodes may be skipped if a transformation returns nil).
+// It ensures that exactly one response (success or error) is sent per node on replyChan.
 func (c *ClientCtx[Req, Resp]) send() {
-	var expected int
-	for _, n := range c.config {
-		msg := c.applyTransforms(c.request, n)
-		if msg == nil {
-			continue // Skip node if transformation returns nil
+	var sharedMsg *stream.Message
+	if len(c.reqTransforms) == 0 {
+		// Fast path: marshal once when no per-node transforms are registered.
+		var err error
+		sharedMsg, err = stream.NewMessage(c.Context, c.msgID, c.method, c.request)
+		if err != nil {
+			// Marshaling fails identically for all nodes; report and return.
+			for _, n := range c.config {
+				c.replyChan <- NodeResponse[msg]{NodeID: n.ID(), Err: err}
+			}
+			return
 		}
-		expected++
+	}
+	for _, n := range c.config {
+		// transform only if there are registered transforms; otherwise reuse the shared message
+		streamMsg := sharedMsg
+		if streamMsg == nil {
+			streamMsg = c.transformAndMarshal(n)
+		}
+		if streamMsg == nil {
+			continue // Skip node: transformAndMarshal already sent ErrSkipNode
+		}
 		n.channel.enqueue(request{
 			ctx:          c.Context,
-			msg:          NewRequestMessage(c.md, msg),
+			msg:          streamMsg,
 			streaming:    c.streaming,
 			waitSendDone: c.waitSendDone,
 			responseChan: c.replyChan,
 		})
 	}
-	c.expectedReplies = expected
+}
+
+// transformAndMarshal applies transformations to the request for the given node,
+// then marshals it into a stream.Message. Returns nil if transformation fails
+// or marshaling fails (in which case the error is sent on replyChan).
+func (c *ClientCtx[Req, Resp]) transformAndMarshal(n *Node) *stream.Message {
+	result := c.request
+	for _, transform := range c.reqTransforms {
+		result = transform(result, n)
+	}
+	// Check if the result is valid
+	if protoReq, ok := any(result).(proto.Message); !ok || protoReq == nil || !protoReq.ProtoReflect().IsValid() {
+		c.replyChan <- NodeResponse[msg]{NodeID: n.ID(), Err: ErrSkipNode}
+		return nil
+	}
+	streamMsg, err := stream.NewMessage(c.Context, c.msgID, c.method, result)
+	if err != nil {
+		c.replyChan <- NodeResponse[msg]{NodeID: n.ID(), Err: err}
+		return nil
+	}
+	return streamMsg
 }
 
 // defaultResponseSeq returns an iterator that yields at most c.expectedReplies responses
@@ -227,7 +238,7 @@ func (c *ClientCtx[Req, Resp]) defaultResponseSeq() ResponseSeq[Resp] {
 	return func(yield func(NodeResponse[Resp]) bool) {
 		// Trigger sending on first iteration
 		c.sendOnce.Do(c.send)
-		for range c.expectedReplies {
+		for range c.Size() {
 			select {
 			case r := <-c.replyChan:
 				res := newNodeResponse[Resp](r)
@@ -270,7 +281,7 @@ func (c *ClientCtx[Req, Resp]) streamingResponseSeq() ResponseSeq[Resp] {
 //
 // The fn receives the original request and a node, and returns the transformed
 // request to send to that node. If the function returns an invalid message or nil,
-// the request to that node is skipped.
+// an ErrSkipNode error is sent for that node, indicating it was skipped.
 func MapRequest[Req, Resp msg](fn func(Req, *Node) Req) QuorumInterceptor[Req, Resp] {
 	return func(ctx *ClientCtx[Req, Resp], next ResponseSeq[Resp]) ResponseSeq[Resp] {
 		if fn != nil {

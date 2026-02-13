@@ -45,9 +45,9 @@ func NewManager(opts ...gorums.ManagerOption) *Manager {
 }
 
 // NewConfiguration returns a configuration based on the provided list of nodes.
-// Nodes can be supplied using WithNodeMap or WithNodeList, or WithNodeIDs.
-// A new configuration can also be created from an existing configuration,
-// using the And, WithNewNodes, Except, and WithoutNodes methods.
+// Nodes can be supplied using WithNodes or WithNodeList.
+// A new configuration can also be created from an existing configuration
+// using the Add, Union, Remove, Difference, Extend, and WithoutErrors methods.
 func NewConfiguration(mgr *Manager, opt gorums.NodeListOption) (Configuration, error) {
 	return gorums.NewConfiguration(mgr, opt)
 }
@@ -93,12 +93,8 @@ func QuorumCall(ctx *ConfigContext, in *Request, opts ...gorums.CallOption) *gor
 }
 
 // UnaryRPC is an RPC call invoked on the node in ctx.
-func UnaryRPC(ctx *NodeContext, in *Request) (resp *Response, err error) {
-	res, err := gorums.RPCCall(ctx, in, "ordering.GorumsTest.UnaryRPC")
-	if err != nil {
-		return nil, err
-	}
-	return res.(*Response), err
+func UnaryRPC(ctx *NodeContext, in *Request) (*Response, error) {
+	return gorums.RPCCall[*Request, *Response](ctx, in, "ordering.GorumsTest.UnaryRPC")
 }
 
 // GorumsTest is the server-side API for the GorumsTest Service
@@ -111,11 +107,17 @@ func RegisterGorumsTestServer(srv *gorums.Server, impl GorumsTestServer) {
 	srv.RegisterHandler("ordering.GorumsTest.QuorumCall", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*Request](in)
 		resp, err := impl.QuorumCall(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 	srv.RegisterHandler("ordering.GorumsTest.UnaryRPC", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*Request](in)
 		resp, err := impl.UnaryRPC(ctx, req)
-		return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+		if err != nil {
+			return nil, err
+		}
+		return gorums.NewResponseMessage(in, resp), nil
 	})
 }

@@ -8,17 +8,10 @@ import (
 
 	"github.com/relab/gorums"
 	"github.com/relab/gorums/internal/testutils/mock"
-	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 	pb "google.golang.org/protobuf/types/known/wrapperspb"
 )
-
-func init() {
-	if encoding.GetCodec(gorums.ContentSubtype) == nil {
-		encoding.RegisterCodec(gorums.NewCodec())
-	}
-}
 
 func TestServerCallback(t *testing.T) {
 	var message string
@@ -46,28 +39,48 @@ func TestServerCallback(t *testing.T) {
 	}
 }
 
-func appendStringInterceptor(in, out string) gorums.Interceptor {
-	return func(ctx gorums.ServerCtx, inMsg *gorums.Message, next gorums.Handler) (*gorums.Message, error) {
-		if req := inMsg.GetProtoMessage(); req != nil {
-			// update the underlying request gorums.Message's proto.Message
-			mock.SetVal(req, mock.GetVal(req)+in)
+func appendStringInterceptor(inStr, outStr string) gorums.Interceptor {
+	return func(ctx gorums.ServerCtx, in *gorums.Message, next gorums.Handler) (*gorums.Message, error) {
+		req := gorums.AsProto[*pb.StringValue](in)
+		// update the underlying request gorums.Message's message field (pb.StringValue in this case)
+		req.Value += inStr
+
+		// TODO(meling): I did not like this change; I need to think more about this;
+		//  can we make interceptors modify the request and responses in a cleaner way?
+		//  Maybe we can add a method to stream.Message to modify/marshal the payload?
+		//  Or maybe interceptors can operate on a InterceptorMessage wrapper that can
+		//  hold the proto message that can be manipulated directly, and only on the way
+		//  out of the interceptor chain, the wrapper is marshaled into the stream.Message.Payload.
+
+		// re-marshal the modified request into the in message
+		reqPayload, err := proto.Marshal(req)
+		if err != nil {
+			return nil, err
 		}
+		in.SetPayload(reqPayload)
+
 		// call the next handler
-		outMsg, err := next(ctx, inMsg)
-		if outMsg != nil {
-			if resp := outMsg.GetProtoMessage(); resp != nil {
-				// update the underlying response gorums.Message's proto.Message
-				mock.SetVal(resp, mock.GetVal(resp)+out)
-			}
+		out, err := next(ctx, in)
+		if err != nil {
+			return nil, err
 		}
-		return outMsg, err
+		resp := gorums.AsProto[*pb.StringValue](out)
+		// update the underlying response gorums.Message's message field (pb.StringValue in this case)
+		resp.Value += outStr
+		// re-marshal the modified response into the out message
+		respPayload, err := proto.Marshal(resp)
+		if err != nil {
+			return nil, err
+		}
+		out.SetPayload(respPayload)
+		return out, err
 	}
 }
 
 type interceptorSrv struct{}
 
-func (interceptorSrv) Test(_ gorums.ServerCtx, req proto.Message) (proto.Message, error) {
-	return pb.String(mock.GetVal(req) + "server-"), nil
+func (interceptorSrv) Test(_ gorums.ServerCtx, req *pb.StringValue) (*pb.StringValue, error) {
+	return pb.String(req.GetValue() + "server-"), nil
 }
 
 func TestServerInterceptorsChain(t *testing.T) {
@@ -80,8 +93,12 @@ func TestServerInterceptorsChain(t *testing.T) {
 		))
 		// register final handler which appends "final-" to the request value
 		s.RegisterHandler(mock.TestMethod, func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
-			resp, err := interceptorSrv.Test(ctx, in.GetProtoMessage())
-			return gorums.NewResponseMessage(in.GetMetadata(), resp), err
+			req := gorums.AsProto[*pb.StringValue](in)
+			resp, err := interceptorSrv.Test(ctx, req)
+			if err != nil {
+				return nil, err
+			}
+			return gorums.NewResponseMessage(in, resp), nil
 		})
 		return s
 	}
@@ -89,7 +106,7 @@ func TestServerInterceptorsChain(t *testing.T) {
 
 	ctx := gorums.TestContext(t, 5*time.Second)
 	nodeCtx := node.Context(ctx)
-	res, err := gorums.RPCCall(nodeCtx, pb.String("client-"), mock.TestMethod)
+	res, err := gorums.RPCCall[*pb.StringValue, *pb.StringValue](nodeCtx, pb.String("client-"), mock.TestMethod)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -97,8 +114,8 @@ func TestServerInterceptorsChain(t *testing.T) {
 		t.Fatalf("unexpected nil response")
 	}
 	want := "client-i1in-i2in-server-i2out-i1out"
-	if mock.GetVal(res) != want {
-		t.Fatalf("unexpected response value: got %q, want %q", mock.GetVal(res), want)
+	if res.GetValue() != want {
+		t.Fatalf("unexpected response value: got %q, want %q", res.GetValue(), want)
 	}
 }
 
@@ -107,7 +124,8 @@ func TestServerInterceptorsChain(t *testing.T) {
 func TestTCPReconnection(t *testing.T) {
 	srv := gorums.NewServer()
 	srv.RegisterHandler(mock.TestMethod, func(_ gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
-		return gorums.NewResponseMessage(in.GetMetadata(), in.GetProtoMessage()), nil
+		req := gorums.AsProto[*pb.StringValue](in)
+		return gorums.NewResponseMessage(in, req), nil
 	})
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
@@ -132,7 +150,7 @@ func TestTCPReconnection(t *testing.T) {
 	// Send first message
 	ctx := gorums.TestContext(t, time.Second)
 	nodeCtx := node.Context(ctx)
-	_, err = gorums.RPCCall(nodeCtx, pb.String("1"), mock.TestMethod)
+	_, err = gorums.RPCCall[*pb.StringValue, *pb.StringValue](nodeCtx, pb.String("1"), mock.TestMethod)
 	if err != nil {
 		t.Fatalf("First call failed: %v", err)
 	}
@@ -147,7 +165,7 @@ func TestTCPReconnection(t *testing.T) {
 	// Sending now should fail or timeout
 	ctx2 := gorums.TestContext(t, 200*time.Millisecond)
 	nodeCtx2 := node.Context(ctx2)
-	_, err = gorums.RPCCall(nodeCtx2, pb.String("2"), mock.TestMethod)
+	_, err = gorums.RPCCall[*pb.StringValue, *pb.StringValue](nodeCtx2, pb.String("2"), mock.TestMethod)
 	if err == nil {
 		// It might succeed if it just queued it? But we wait for response.
 	} else {
@@ -162,7 +180,8 @@ func TestTCPReconnection(t *testing.T) {
 
 	srv2 := gorums.NewServer()
 	srv2.RegisterHandler(mock.TestMethod, func(_ gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
-		return gorums.NewResponseMessage(in.GetMetadata(), in.GetProtoMessage()), nil
+		req := gorums.AsProto[*pb.StringValue](in)
+		return gorums.NewResponseMessage(in, req), nil
 	})
 	go func() {
 		_ = srv2.Serve(lis2)
@@ -175,7 +194,7 @@ func TestTCPReconnection(t *testing.T) {
 	// Send message again
 	ctx3 := gorums.TestContext(t, 2*time.Second)
 	nodeCtx3 := node.Context(ctx3)
-	_, err = gorums.RPCCall(nodeCtx3, pb.String("3"), mock.TestMethod)
+	_, err = gorums.RPCCall[*pb.StringValue, *pb.StringValue](nodeCtx3, pb.String("3"), mock.TestMethod)
 	if err != nil {
 		t.Errorf("Call after reconnection failed: %v", err)
 	}
