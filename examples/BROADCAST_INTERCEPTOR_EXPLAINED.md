@@ -88,7 +88,7 @@ The **Broadcast Interceptor** is a middleware component that automatically repli
 
 ```go
 func NewBroadcastInterceptor[Req, Resp proto.Message](
-    cfg gorums.Configuration, 
+    cfg gorums.Configuration,
     method string,
 ) gorums.Interceptor
 ```
@@ -111,13 +111,13 @@ func NewBroadcastInterceptor[Req, Resp proto.Message](cfg gorums.Configuration, 
     // ┌─────────────────────────────────────────────────────────┐
     // │ CLOSURE STATE - Persists for lifetime of interceptor   │
     // └─────────────────────────────────────────────────────────┘
-    
+
     var mu sync.Mutex
     broadcastedHashes := make(map[string]struct{})
-    
+
     // ↑ This state is shared across ALL requests to this server
     // Used for loop detection
-    
+
     return func(ctx gorums.ServerCtx, msg *gorums.Message, next gorums.Handler) (*gorums.Message, error) {
         // Interceptor logic here...
     }
@@ -158,7 +158,7 @@ return func(ctx gorums.ServerCtx, msg *gorums.Message, next gorums.Handler) (*go
     _, alreadyBroadcasted := broadcastedHashes[hashStr]
     if !alreadyBroadcasted {
         broadcastedHashes[hashStr] = struct{}{}
-        
+
         // Cache cleanup to prevent memory leak
         if len(broadcastedHashes) > 10000 {
             count := 0
@@ -205,7 +205,7 @@ return func(ctx gorums.ServerCtx, msg *gorums.Message, next gorums.Handler) (*go
             go func(n *gorums.Node) {
                 defer wg.Done()
                 nodeCtx := n.Context(broadcastCtx)
-                
+
                 // Make typed RPC call
                 _, _ = gorums.RPCCall[Req, Resp](nodeCtx, msgCopy, method)
                 // Errors silently ignored (fire-and-forget)
@@ -602,7 +602,7 @@ The interceptor uses Go generics to ensure compile-time type safety:
 
 ```go
 func NewBroadcastInterceptor[Req, Resp proto.Message](
-    cfg gorums.Configuration, 
+    cfg gorums.Configuration,
     method string,
 ) gorums.Interceptor
 ```
@@ -684,10 +684,10 @@ for i, addr := range listeners {
             otherNodes = append(otherNodes, otherAddr)
         }
     }
-    
+
     // Start server with broadcast capability
     srv, realAddr := startServerWithBroadcast(addr, otherNodes)
-    
+
     // Server 0 broadcasts to [Server1, Server2, Server3]
     // Server 1 broadcasts to [Server0, Server2, Server3]
     // etc.
@@ -700,55 +700,55 @@ for i, addr := range listeners {
 func startServerWithBroadcast(address string, otherNodes []string) (*gorums.Server, string) {
     // Listen on address
     lis, err := net.Listen("tcp", address)
-    
+
     // Create storage implementation
     storage := newStorageServer()
-    
+
     // Build interceptor chain
     interceptorChain := []gorums.Interceptor{
         interceptors.LoggingSimpleInterceptor,
         interceptors.NoFooAllowedInterceptor[*pb.WriteRequest],
         interceptors.MetadataInterceptor,
     }
-    
+
     // If other nodes provided, add broadcast interceptor
     if len(otherNodes) > 0 {
         // ┌──────────────────────────────────────────────────┐
         // │ SERVER BECOMES CLIENT TO OTHER SERVERS           │
         // └──────────────────────────────────────────────────┘
-        
+
         // Create client manager
         clientMgr := pb.NewManager(
             gorums.WithDialOptions(
                 grpc.WithTransportCredentials(insecure.NewCredentials()),
             ),
         )
-        
+
         // Create configuration pointing to other servers
         clientCfg, err := pb.NewConfiguration(
-            clientMgr, 
+            clientMgr,
             gorums.WithNodeList(otherNodes),
         )
-        
+
         // Create broadcast interceptor with type parameters
         broadcastInterceptor := interceptors.NewBroadcastInterceptor[
             *pb.WriteRequest,
             *pb.WriteResponse,
         ](clientCfg, "proto.Storage.WriteRPC")
-        
+
         // Add to chain
         interceptorChain = append(interceptorChain, broadcastInterceptor)
     }
-    
+
     // Create Gorums server with interceptors
     srv := gorums.NewServer(gorums.WithInterceptors(interceptorChain...))
-    
+
     // Register storage service
     pb.RegisterStorageServer(srv, storage)
-    
+
     // Start serving
     go srv.Serve(lis)
-    
+
     return srv, lis.Addr().String()
 }
 ```
@@ -779,7 +779,7 @@ otherNodes = [Server0, Server1, Server2, Server3]  // ❌ WRONG
 
 // Then when broadcasting:
 for _, node := range cfg.Nodes() {
-    RPCCall(node, msg)  
+    RPCCall(node, msg)
     // Would call itself! Unnecessary self-RPC
     // Already processed locally via next()
 }
@@ -900,7 +900,7 @@ Server 0:
       ├─ Cache check: FOUND! ✓ (already broadcasted at T=1ms)
       ├─ Decision: SKIP BROADCAST
       └─ Process locally only (idempotent write)
-      
+
 🛡️ LOOP PREVENTED!
 
 ════════════════════════════════════════════════════════════════
