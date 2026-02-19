@@ -2,6 +2,7 @@ package gorums_test
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -197,5 +198,49 @@ func TestTCPReconnection(t *testing.T) {
 	_, err = gorums.RPCCall[*pb.StringValue, *pb.StringValue](nodeCtx3, pb.String("3"), mock.TestMethod)
 	if err != nil {
 		t.Errorf("Call after reconnection failed: %v", err)
+	}
+}
+
+// TestServerConfigurationAccess verifies that handlers can access the server's
+// configuration (nodes) via ServerCtx. This is essential for implementing broadcast.
+func TestServerConfigurationAccess(t *testing.T) {
+	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
+	defer mgr.Close()
+
+	// Create a configuration with 3 nodes
+	cfg, err := gorums.NewConfiguration(mgr, gorums.WithNodeList([]string{
+		"localhost:9001",
+		"localhost:9002",
+		"localhost:9003",
+	}))
+	if err != nil {
+		t.Fatalf("NewConfiguration failed: %v", err)
+	}
+
+	// Server that passes configuration to handler
+	serverFn := func(_ int) gorums.ServerIface {
+		srv := gorums.NewServer(gorums.WithConfiguration(&cfg))
+		srv.RegisterHandler(mock.TestMethod, func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
+			config := ctx.Config()
+			if config == nil {
+				return gorums.NewResponseMessage(in, pb.String("error: config-nil")), nil
+			}
+			// Access the node slice
+			nodes := *config
+			return gorums.NewResponseMessage(in, pb.String(fmt.Sprintf("nodes=%d", len(nodes)))), nil
+		})
+		return srv
+	}
+
+	node := gorums.TestNode(t, serverFn)
+
+	ctx := gorums.TestContext(t, 5*time.Second)
+	nodeCtx := node.Context(ctx)
+	res, err := gorums.RPCCall[*pb.StringValue, *pb.StringValue](nodeCtx, pb.String(""), mock.TestMethod)
+	if err != nil {
+		t.Fatalf("RPC call failed: %v", err)
+	}
+	if res.GetValue() != "nodes=3" {
+		t.Errorf("expected 'nodes=3', got %q", res.GetValue())
 	}
 }

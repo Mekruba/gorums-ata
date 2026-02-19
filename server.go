@@ -24,12 +24,14 @@ type streamServer struct {
 	handlers map[string]Handler
 	opts     *serverOptions
 	stream.UnimplementedGorumsServer
+	config *Configuration
 }
 
 func newStreamServer(opts *serverOptions) *streamServer {
 	return &streamServer{
 		handlers: make(map[string]Handler),
 		opts:     opts,
+		config:   opts.configuration,
 	}
 }
 
@@ -74,7 +76,7 @@ func (s *streamServer) NodeStream(srv stream.Gorums_NodeStreamServer) error {
 			// This func() is the default interceptor; it is the first and last handler in the chain.
 			// It is responsible for releasing the mutex when the handler chain is done.
 			go func() {
-				srvCtx := newServerCtx(streamIn.AppendToIncomingContext(ctx), &mut, finished)
+				srvCtx := newServerCtx(streamIn.AppendToIncomingContext(ctx), &mut, finished, s.config)
 				defer srvCtx.Release()
 
 				msg, err := unmarshalRequest(streamIn)
@@ -106,10 +108,18 @@ type serverOptions struct {
 	grpcOpts        []grpc.ServerOption
 	connectCallback func(context.Context)
 	interceptors    []Interceptor
+	configuration   *Configuration
 }
 
 // ServerOption is used to change settings for the GorumsServer
 type ServerOption func(*serverOptions)
+
+// New server option
+func WithConfiguration(config *Configuration) ServerOption {
+	return func(o *serverOptions) {
+		o.configuration = config // Store pointer
+	}
+}
 
 // WithReceiveBufferSize sets the buffer size for the server.
 // A larger buffer may result in higher throughput at the cost of higher latency.
@@ -216,15 +226,17 @@ func (s *Server) Stop() {
 // This happens automatically when the handler returns.
 type ServerCtx struct {
 	context.Context
-	once *sync.Once // must be a pointer to avoid passing ctx by value
-	mut  *sync.Mutex
-	c    chan<- *stream.Message
+	config *Configuration
+	once   *sync.Once // must be a pointer to avoid passing ctx by value
+	mut    *sync.Mutex
+	c      chan<- *stream.Message
 }
 
 // newServerCtx creates a new ServerCtx with the given context, mutex and metadata channel.
-func newServerCtx(ctx context.Context, mut *sync.Mutex, c chan<- *stream.Message) ServerCtx {
+func newServerCtx(ctx context.Context, mut *sync.Mutex, c chan<- *stream.Message, config *Configuration) ServerCtx {
 	return ServerCtx{
 		Context: ctx,
+		config:  config,
 		once:    new(sync.Once),
 		mut:     mut,
 		c:       c,
@@ -236,6 +248,11 @@ func newServerCtx(ctx context.Context, mut *sync.Mutex, c chan<- *stream.Message
 // exclusive access to the server's state. It is safe to call Release multiple times.
 func (ctx *ServerCtx) Release() {
 	ctx.once.Do(ctx.mut.Unlock)
+}
+
+// Nil-safe accessor to the Nodes
+func (ctx *ServerCtx) Config() *Configuration {
+	return ctx.config // Can be nil
 }
 
 // SendMessage attempts to send the given message to the client.
