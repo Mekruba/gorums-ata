@@ -1,0 +1,36 @@
+edition = "2024";
+
+package broadcast;
+
+option go_package = "gorums/examples/broadcast/proto";
+option features.field_presence = IMPLICIT;
+
+import "google/protobuf/empty.proto";
+import "gorums.proto";
+
+// Broadcast service for testing server-to-server broadcast with responses.
+service Broadcast {
+  // Broadcast receives a message and relays it to all other nodes (no response).
+  rpc Broadcast(BroadcastMsg) returns (google.protobuf.Empty) {
+    option (gorums.unicast) = true;
+  }
+
+  // BroadcastQC is a quorum call that broadcasts and collects acknowledgments.
+  // Each node acknowledges receipt and forwards to others.
+  rpc BroadcastQC(BroadcastMsg) returns (BroadcastAck) {
+    option (gorums.quorumcall) = true;
+  }
+}
+
+// BroadcastMsg is a simple broadcast message.
+message BroadcastMsg {
+  string data   = 1; // Message payload
+  uint32 sender = 2; // Original sender ID
+}
+
+// BroadcastAck acknowledges receipt of a broadcast message.
+message BroadcastAck {
+  uint32 node_id = 1;     // ID of node sending this ack
+  bool delivered = 2;      // Whether message was delivered (not duplicate)
+  uint32 forwarded_to = 3; // Number of nodes forwarded to
+}
