@@ -2,7 +2,7 @@ proto_include := $(shell go list -m -f {{.Dir}} github.com/relab/gorums)
 proto_src := $(shell find . -type f -name '*.proto')
 proto_go := $(proto_src:%.proto=%.pb.go)
 gorums_go := $(proto_src:%.proto=%_gorums.pb.go)
-binaries := storage/storage broadcast/broadcast
+binaries := storage/storage broadcast/broadcast paxos/paxos
 
 .PHONY: all debug proto download tools $(binaries)
 

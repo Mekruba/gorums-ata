@@ -1,0 +1,68 @@
+edition = "2023";
+
+package paxos;
+
+option go_package = "gorums/examples/paxos/proto";
+option features.field_presence = IMPLICIT;
+
+import "gorums.proto";
+
+// Paxos service implementing the Paxos consensus protocol.
+service Paxos {
+  // Prepare is Phase 1a: Proposer asks acceptors to promise not to accept
+  // proposals with lower numbers.
+  rpc Prepare(PrepareRequest) returns (PromiseResponse) {
+    option (gorums.quorumcall) = true;
+  }
+
+  // Accept is Phase 2a: Proposer asks acceptors to accept a value.
+  rpc Accept(AcceptRequest) returns (AcceptedResponse) {
+    option (gorums.quorumcall) = true;
+  }
+
+  // Learn notifies learners of the chosen value (one-way).
+  rpc Learn(LearnRequest) returns (LearnResponse) {
+    option (gorums.quorumcall) = true;
+  }
+}
+
+// PrepareRequest is Phase 1a message from proposer to acceptors.
+message PrepareRequest {
+  uint32 proposal_num = 1; // Proposal number (n)
+  uint32 proposer_id  = 2; // ID of the proposer
+}
+
+// PromiseResponse is Phase 1b message from acceptor to proposer.
+message PromiseResponse {
+  uint32 acceptor_id           = 1; // ID of responding acceptor
+  bool   promised              = 2; // Whether acceptor promises
+  uint32 accepted_proposal_num = 3; // Highest accepted proposal number (if any)
+  string accepted_value        = 4; // Value of highest accepted proposal (if any)
+}
+
+// AcceptRequest is Phase 2a message from proposer to acceptors.
+message AcceptRequest {
+  uint32 proposal_num = 1; // Proposal number (n)
+  string value        = 2; // Value to accept
+  uint32 proposer_id  = 3; // ID of the proposer
+}
+
+// AcceptedResponse is Phase 2b message from acceptor to proposer.
+message AcceptedResponse {
+  uint32 acceptor_id  = 1; // ID of responding acceptor
+  bool   accepted     = 2; // Whether acceptor accepted the value
+  uint32 proposal_num = 3; // Proposal number accepted
+}
+
+// LearnRequest notifies learners of chosen value.
+message LearnRequest {
+  uint32 proposal_num = 1; // Proposal number that was chosen
+  string value        = 2; // The chosen value
+  uint32 proposer_id  = 3; // ID of the proposer
+}
+
+// LearnResponse acknowledges learning.
+message LearnResponse {
+  uint32 learner_id = 1; // ID of responding learner
+  bool   learned    = 2; // Whether learner learned this value
+}

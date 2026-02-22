@@ -1,4 +1,4 @@
-edition = "2024";
+edition = "2023";
 
 package gorumsexample;
 option go_package = "github.com/relab/gorums/examples/gorumsexample";
@@ -41,6 +41,6 @@ service Storage {
 
 // State represents the value and its timestamp stored in a node.
 message State {
-  string value = 1;
-  int64 timestamp = 2;
+  string value     = 1;
+  int64  timestamp = 2;
 }
