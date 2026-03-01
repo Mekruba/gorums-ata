@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"log"
+	"strings"
 )
 
 // Fixed list of nodes (acceptors/learners)
@@ -19,7 +20,7 @@ func main() {
 	var (
 		nodeID     = flag.Uint("id", 0, "Node ID (1, 2, or 3 for server/acceptor)")
 		isProposer = flag.Bool("propose", false, "Run as proposer instead of server")
-		value      = flag.String("value", "default-value", "Value to propose (proposer mode)")
+		values     = flag.String("values", "", "Comma-separated values to propose (proposer mode)")
 	)
 	flag.Parse()
 
@@ -27,7 +28,21 @@ func main() {
 		if *nodeID == 0 {
 			*nodeID = 100 // Default proposer ID
 		}
-		runProposer(uint32(*nodeID), *value)
+
+		// Parse values
+		var valueList []string
+		if *values != "" {
+			valueList = strings.Split(*values, ",")
+			// Trim spaces
+			for i := range valueList {
+				valueList[i] = strings.TrimSpace(valueList[i])
+			}
+		} else {
+			// Default: demonstrate Multi-Paxos with 3 values
+			valueList = []string{"value-1", "value-2", "value-3"}
+		}
+
+		runProposer(uint32(*nodeID), valueList)
 	} else {
 		if *nodeID == 0 || *nodeID > 3 {
 			log.Fatal("Server mode requires -id flag (1, 2, or 3)")

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/relab/gorums"
 	pb "github.com/relab/gorums/examples/paxos/proto"
@@ -92,13 +94,9 @@ func (n nodeAddr) Addr() string {
 	return n.addr
 }
 
-// PaxosServer implements a Paxos acceptor and learner.
-type PaxosServer struct {
-	id     uint32
-	config gorums.Configuration
-
+// instanceState holds the state for a single Paxos instance.
+type instanceState struct {
 	// Acceptor state (persistent in real implementation)
-	mu                  sync.Mutex
 	promisedProposalNum uint32 // Highest proposal number promised
 	acceptedProposalNum uint32 // Highest proposal number accepted
 	acceptedValue       string // Value of highest accepted proposal
@@ -106,49 +104,77 @@ type PaxosServer struct {
 	// Learner state
 	learnedValue   string // The chosen value
 	learnedFromNum uint32 // Proposal number of learned value
-	learnedMu      sync.RWMutex
+}
+
+// PaxosServer implements a Multi-Paxos acceptor and learner.
+type PaxosServer struct {
+	id     uint32
+	config gorums.Configuration
+
+	mu        sync.RWMutex
+	instances map[uint32]*instanceState // Per-instance state
 }
 
 func NewPaxosServer(id uint32, config gorums.Configuration) *PaxosServer {
 	return &PaxosServer{
-		id:     id,
-		config: config,
+		id:        id,
+		config:    config,
+		instances: make(map[uint32]*instanceState),
 	}
+}
+
+// getInstance returns the state for the given instance, creating it if needed.
+func (p *PaxosServer) getInstance(instance uint32) *instanceState {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if state, exists := p.instances[instance]; exists {
+		return state
+	}
+
+	state := &instanceState{}
+	p.instances[instance] = state
+	return state
 }
 
 // Prepare handles Phase 1a: Prepare request from proposer.
 // Acceptor promises not to accept proposals with lower numbers.
 func (p *PaxosServer) Prepare(ctx gorums.ServerCtx, req *pb.PrepareRequest) (*pb.PromiseResponse, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
+	instance := req.GetInstance()
 	proposalNum := req.GetProposalNum()
 	proposerID := req.GetProposerId()
 
-	fmt.Printf("Node %d: Received PREPARE(%d) from proposer %d\n",
-		p.id, proposalNum, proposerID)
+	fmt.Printf("Node %d: Received PREPARE(inst=%d, num=%d) from proposer %d\n",
+		p.id, instance, proposalNum, proposerID)
+
+	state := p.getInstance(instance)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	// If this proposal number is higher than any we've seen, promise it
-	if proposalNum > p.promisedProposalNum {
-		p.promisedProposalNum = proposalNum
+	if proposalNum > state.promisedProposalNum {
+		state.promisedProposalNum = proposalNum
 
-		fmt.Printf("Node %d: PROMISE(%d) - accepted_num=%d, accepted_val='%s'\n",
-			p.id, proposalNum, p.acceptedProposalNum, p.acceptedValue)
+		fmt.Printf("Node %d: PROMISE(inst=%d, num=%d) - accepted_num=%d, accepted_val='%s'\n",
+			p.id, instance, proposalNum, state.acceptedProposalNum, state.acceptedValue)
 
 		return pb.PromiseResponse_builder{
 			AcceptorId:          p.id,
+			Instance:            instance,
 			Promised:            true,
-			AcceptedProposalNum: p.acceptedProposalNum,
-			AcceptedValue:       p.acceptedValue,
+			AcceptedProposalNum: state.acceptedProposalNum,
+			AcceptedValue:       state.acceptedValue,
 		}.Build(), nil
 	}
 
 	// Reject: we've already promised a higher proposal number
-	fmt.Printf("Node %d: REJECT PREPARE(%d) - already promised %d\n",
-		p.id, proposalNum, p.promisedProposalNum)
+	fmt.Printf("Node %d: REJECT PREPARE(inst=%d, num=%d) - already promised %d\n",
+		p.id, instance, proposalNum, state.promisedProposalNum)
 
 	return pb.PromiseResponse_builder{
 		AcceptorId: p.id,
+		Instance:   instance,
 		Promised:   false,
 	}.Build(), nil
 }
@@ -156,75 +182,116 @@ func (p *PaxosServer) Prepare(ctx gorums.ServerCtx, req *pb.PrepareRequest) (*pb
 // Accept handles Phase 2a: Accept request from proposer.
 // Acceptor accepts the value if it hasn't promised a higher proposal.
 func (p *PaxosServer) Accept(ctx gorums.ServerCtx, req *pb.AcceptRequest) (*pb.AcceptedResponse, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
+	instance := req.GetInstance()
 	proposalNum := req.GetProposalNum()
 	value := req.GetValue()
 	proposerID := req.GetProposerId()
 
-	fmt.Printf("Node %d: Received ACCEPT(%d, '%s') from proposer %d\n",
-		p.id, proposalNum, value, proposerID)
+	fmt.Printf("Node %d: Received ACCEPT(inst=%d, num=%d, val='%s') from proposer %d\n",
+		p.id, instance, proposalNum, value, proposerID)
+
+	state := p.getInstance(instance)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	// Accept if proposal number >= promised number
-	if proposalNum >= p.promisedProposalNum {
-		p.promisedProposalNum = proposalNum
-		p.acceptedProposalNum = proposalNum
-		p.acceptedValue = value
+	if proposalNum >= state.promisedProposalNum {
+		state.promisedProposalNum = proposalNum
+		state.acceptedProposalNum = proposalNum
+		state.acceptedValue = value
 
-		fmt.Printf("Node %d: ACCEPTED(%d, '%s')\n", p.id, proposalNum, value)
+		fmt.Printf("Node %d: ACCEPTED(inst=%d, num=%d, val='%s')\n", p.id, instance, proposalNum, value)
 
 		return pb.AcceptedResponse_builder{
 			AcceptorId:  p.id,
+			Instance:    instance,
 			Accepted:    true,
 			ProposalNum: proposalNum,
 		}.Build(), nil
 	}
 
 	// Reject: we've promised a higher proposal number
-	fmt.Printf("Node %d: REJECT ACCEPT(%d) - promised %d\n",
-		p.id, proposalNum, p.promisedProposalNum)
+	fmt.Printf("Node %d: REJECT ACCEPT(inst=%d, num=%d) - promised %d\n",
+		p.id, instance, proposalNum, state.promisedProposalNum)
 
 	return pb.AcceptedResponse_builder{
 		AcceptorId:  p.id,
+		Instance:    instance,
 		Accepted:    false,
-		ProposalNum: p.promisedProposalNum,
+		ProposalNum: state.promisedProposalNum,
 	}.Build(), nil
 }
 
 // Learn handles learning of chosen value.
+// When a node learns a value, it broadcasts to other nodes using ServerCtx.Config().
 func (p *PaxosServer) Learn(ctx gorums.ServerCtx, req *pb.LearnRequest) (*pb.LearnResponse, error) {
+	instance := req.GetInstance()
 	proposalNum := req.GetProposalNum()
 	value := req.GetValue()
 	proposerID := req.GetProposerId()
 
-	p.learnedMu.Lock()
-	defer p.learnedMu.Unlock()
+	state := p.getInstance(instance)
 
+	p.mu.Lock()
 	// Only learn if we haven't learned anything yet, or this is a higher proposal
-	if p.learnedValue == "" || proposalNum > p.learnedFromNum {
-		p.learnedValue = value
-		p.learnedFromNum = proposalNum
+	if state.learnedValue == "" || proposalNum > state.learnedFromNum {
+		state.learnedValue = value
+		state.learnedFromNum = proposalNum
+		p.mu.Unlock()
 
-		fmt.Printf("\n🎉 Node %d: LEARNED value '%s' (proposal %d from proposer %d)\n\n",
-			p.id, value, proposalNum, proposerID)
+		fmt.Printf("\n🎉 Node %d: LEARNED value '%s' (inst=%d, proposal=%d from proposer %d)\n\n",
+			p.id, value, instance, proposalNum, proposerID)
+
+		// Broadcast to other nodes using ServerCtx.Config()
+		// This demonstrates server-to-server communication in Multi-Paxos
+		if cfg := ctx.Config(); cfg != nil && cfg.Size() > 1 {
+			go p.broadcastLearn(cfg, req)
+		}
 
 		return pb.LearnResponse_builder{
 			LearnerId: p.id,
+			Instance:  instance,
 			Learned:   true,
 		}.Build(), nil
 	}
+	p.mu.Unlock()
 
 	// Already learned this or a newer value
 	return pb.LearnResponse_builder{
 		LearnerId: p.id,
+		Instance:  instance,
 		Learned:   false,
 	}.Build(), nil
 }
 
-// GetLearnedValue returns the learned value (for testing/querying).
-func (p *PaxosServer) GetLearnedValue() string {
-	p.learnedMu.RLock()
-	defer p.learnedMu.RUnlock()
-	return p.learnedValue
+// broadcastLearn broadcasts learned value to other nodes.
+func (p *PaxosServer) broadcastLearn(cfg *gorums.Configuration, req *pb.LearnRequest) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cfgCtx := (*cfg).Context(ctx)
+	learned := pb.Learn(cfgCtx, req)
+
+	for learn := range learned.Seq() {
+		if learn.Err != nil {
+			// Silently ignore errors in broadcast
+			continue
+		}
+		if learn.Value.GetLearned() {
+			fmt.Printf("Node %d: Broadcast learned to node %d (inst=%d)\n",
+				p.id, learn.NodeID, req.GetInstance())
+		}
+	}
+}
+
+// GetLearnedValue returns the learned value for a specific instance (for testing/querying).
+func (p *PaxosServer) GetLearnedValue(instance uint32) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if state, exists := p.instances[instance]; exists {
+		return state.learnedValue
+	}
+	return ""
 }

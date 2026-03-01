@@ -56,7 +56,7 @@
         "usePlaceholders": true,
         "staticcheck": false
     },
-    "protobuf.protoc.path": "protoc",
+    "protobuf.protoc.path": "/usr/local/bin/protoc",
     "protobuf.formatOnSave": true,
     "protobuf.formatter.enabled": true,
     "protobuf.formatter.alignFields": true,

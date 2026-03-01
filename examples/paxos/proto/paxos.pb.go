@@ -24,8 +24,9 @@ const (
 // PrepareRequest is Phase 1a message from proposer to acceptors.
 type PrepareRequest struct {
 	state                  protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_ProposalNum uint32                 `protobuf:"varint,1,opt,name=proposal_num,json=proposalNum"`
-	xxx_hidden_ProposerId  uint32                 `protobuf:"varint,2,opt,name=proposer_id,json=proposerId"`
+	xxx_hidden_Instance    uint32                 `protobuf:"varint,1,opt,name=instance"`
+	xxx_hidden_ProposalNum uint32                 `protobuf:"varint,2,opt,name=proposal_num,json=proposalNum"`
+	xxx_hidden_ProposerId  uint32                 `protobuf:"varint,3,opt,name=proposer_id,json=proposerId"`
 	unknownFields          protoimpl.UnknownFields
 	sizeCache              protoimpl.SizeCache
 }
@@ -55,6 +56,13 @@ func (x *PrepareRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
+func (x *PrepareRequest) GetInstance() uint32 {
+	if x != nil {
+		return x.xxx_hidden_Instance
+	}
+	return 0
+}
+
 func (x *PrepareRequest) GetProposalNum() uint32 {
 	if x != nil {
 		return x.xxx_hidden_ProposalNum
@@ -69,6 +77,10 @@ func (x *PrepareRequest) GetProposerId() uint32 {
 	return 0
 }
 
+func (x *PrepareRequest) SetInstance(v uint32) {
+	x.xxx_hidden_Instance = v
+}
+
 func (x *PrepareRequest) SetProposalNum(v uint32) {
 	x.xxx_hidden_ProposalNum = v
 }
@@ -80,6 +92,7 @@ func (x *PrepareRequest) SetProposerId(v uint32) {
 type PrepareRequest_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
+	Instance    uint32
 	ProposalNum uint32
 	ProposerId  uint32
 }
@@ -88,6 +101,7 @@ func (b0 PrepareRequest_builder) Build() *PrepareRequest {
 	m0 := &PrepareRequest{}
 	b, x := &b0, m0
 	_, _ = b, x
+	x.xxx_hidden_Instance = b.Instance
 	x.xxx_hidden_ProposalNum = b.ProposalNum
 	x.xxx_hidden_ProposerId = b.ProposerId
 	return m0
@@ -97,9 +111,10 @@ func (b0 PrepareRequest_builder) Build() *PrepareRequest {
 type PromiseResponse struct {
 	state                          protoimpl.MessageState `protogen:"opaque.v1"`
 	xxx_hidden_AcceptorId          uint32                 `protobuf:"varint,1,opt,name=acceptor_id,json=acceptorId"`
-	xxx_hidden_Promised            bool                   `protobuf:"varint,2,opt,name=promised"`
-	xxx_hidden_AcceptedProposalNum uint32                 `protobuf:"varint,3,opt,name=accepted_proposal_num,json=acceptedProposalNum"`
-	xxx_hidden_AcceptedValue       string                 `protobuf:"bytes,4,opt,name=accepted_value,json=acceptedValue"`
+	xxx_hidden_Instance            uint32                 `protobuf:"varint,2,opt,name=instance"`
+	xxx_hidden_Promised            bool                   `protobuf:"varint,3,opt,name=promised"`
+	xxx_hidden_AcceptedProposalNum uint32                 `protobuf:"varint,4,opt,name=accepted_proposal_num,json=acceptedProposalNum"`
+	xxx_hidden_AcceptedValue       string                 `protobuf:"bytes,5,opt,name=accepted_value,json=acceptedValue"`
 	unknownFields                  protoimpl.UnknownFields
 	sizeCache                      protoimpl.SizeCache
 }
@@ -136,6 +151,13 @@ func (x *PromiseResponse) GetAcceptorId() uint32 {
 	return 0
 }
 
+func (x *PromiseResponse) GetInstance() uint32 {
+	if x != nil {
+		return x.xxx_hidden_Instance
+	}
+	return 0
+}
+
 func (x *PromiseResponse) GetPromised() bool {
 	if x != nil {
 		return x.xxx_hidden_Promised
@@ -161,6 +183,10 @@ func (x *PromiseResponse) SetAcceptorId(v uint32) {
 	x.xxx_hidden_AcceptorId = v
 }
 
+func (x *PromiseResponse) SetInstance(v uint32) {
+	x.xxx_hidden_Instance = v
+}
+
 func (x *PromiseResponse) SetPromised(v bool) {
 	x.xxx_hidden_Promised = v
 }
@@ -177,6 +203,7 @@ type PromiseResponse_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
 	AcceptorId          uint32
+	Instance            uint32
 	Promised            bool
 	AcceptedProposalNum uint32
 	AcceptedValue       string
@@ -187,6 +214,7 @@ func (b0 PromiseResponse_builder) Build() *PromiseResponse {
 	b, x := &b0, m0
 	_, _ = b, x
 	x.xxx_hidden_AcceptorId = b.AcceptorId
+	x.xxx_hidden_Instance = b.Instance
 	x.xxx_hidden_Promised = b.Promised
 	x.xxx_hidden_AcceptedProposalNum = b.AcceptedProposalNum
 	x.xxx_hidden_AcceptedValue = b.AcceptedValue
@@ -196,9 +224,10 @@ func (b0 PromiseResponse_builder) Build() *PromiseResponse {
 // AcceptRequest is Phase 2a message from proposer to acceptors.
 type AcceptRequest struct {
 	state                  protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_ProposalNum uint32                 `protobuf:"varint,1,opt,name=proposal_num,json=proposalNum"`
-	xxx_hidden_Value       string                 `protobuf:"bytes,2,opt,name=value"`
-	xxx_hidden_ProposerId  uint32                 `protobuf:"varint,3,opt,name=proposer_id,json=proposerId"`
+	xxx_hidden_Instance    uint32                 `protobuf:"varint,1,opt,name=instance"`
+	xxx_hidden_ProposalNum uint32                 `protobuf:"varint,2,opt,name=proposal_num,json=proposalNum"`
+	xxx_hidden_Value       string                 `protobuf:"bytes,3,opt,name=value"`
+	xxx_hidden_ProposerId  uint32                 `protobuf:"varint,4,opt,name=proposer_id,json=proposerId"`
 	unknownFields          protoimpl.UnknownFields
 	sizeCache              protoimpl.SizeCache
 }
@@ -228,6 +257,13 @@ func (x *AcceptRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
+func (x *AcceptRequest) GetInstance() uint32 {
+	if x != nil {
+		return x.xxx_hidden_Instance
+	}
+	return 0
+}
+
 func (x *AcceptRequest) GetProposalNum() uint32 {
 	if x != nil {
 		return x.xxx_hidden_ProposalNum
@@ -249,6 +285,10 @@ func (x *AcceptRequest) GetProposerId() uint32 {
 	return 0
 }
 
+func (x *AcceptRequest) SetInstance(v uint32) {
+	x.xxx_hidden_Instance = v
+}
+
 func (x *AcceptRequest) SetProposalNum(v uint32) {
 	x.xxx_hidden_ProposalNum = v
 }
@@ -264,6 +304,7 @@ func (x *AcceptRequest) SetProposerId(v uint32) {
 type AcceptRequest_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
+	Instance    uint32
 	ProposalNum uint32
 	Value       string
 	ProposerId  uint32
@@ -273,6 +314,7 @@ func (b0 AcceptRequest_builder) Build() *AcceptRequest {
 	m0 := &AcceptRequest{}
 	b, x := &b0, m0
 	_, _ = b, x
+	x.xxx_hidden_Instance = b.Instance
 	x.xxx_hidden_ProposalNum = b.ProposalNum
 	x.xxx_hidden_Value = b.Value
 	x.xxx_hidden_ProposerId = b.ProposerId
@@ -283,8 +325,9 @@ func (b0 AcceptRequest_builder) Build() *AcceptRequest {
 type AcceptedResponse struct {
 	state                  protoimpl.MessageState `protogen:"opaque.v1"`
 	xxx_hidden_AcceptorId  uint32                 `protobuf:"varint,1,opt,name=acceptor_id,json=acceptorId"`
-	xxx_hidden_Accepted    bool                   `protobuf:"varint,2,opt,name=accepted"`
-	xxx_hidden_ProposalNum uint32                 `protobuf:"varint,3,opt,name=proposal_num,json=proposalNum"`
+	xxx_hidden_Instance    uint32                 `protobuf:"varint,2,opt,name=instance"`
+	xxx_hidden_Accepted    bool                   `protobuf:"varint,3,opt,name=accepted"`
+	xxx_hidden_ProposalNum uint32                 `protobuf:"varint,4,opt,name=proposal_num,json=proposalNum"`
 	unknownFields          protoimpl.UnknownFields
 	sizeCache              protoimpl.SizeCache
 }
@@ -321,6 +364,13 @@ func (x *AcceptedResponse) GetAcceptorId() uint32 {
 	return 0
 }
 
+func (x *AcceptedResponse) GetInstance() uint32 {
+	if x != nil {
+		return x.xxx_hidden_Instance
+	}
+	return 0
+}
+
 func (x *AcceptedResponse) GetAccepted() bool {
 	if x != nil {
 		return x.xxx_hidden_Accepted
@@ -339,6 +389,10 @@ func (x *AcceptedResponse) SetAcceptorId(v uint32) {
 	x.xxx_hidden_AcceptorId = v
 }
 
+func (x *AcceptedResponse) SetInstance(v uint32) {
+	x.xxx_hidden_Instance = v
+}
+
 func (x *AcceptedResponse) SetAccepted(v bool) {
 	x.xxx_hidden_Accepted = v
 }
@@ -351,6 +405,7 @@ type AcceptedResponse_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
 	AcceptorId  uint32
+	Instance    uint32
 	Accepted    bool
 	ProposalNum uint32
 }
@@ -360,6 +415,7 @@ func (b0 AcceptedResponse_builder) Build() *AcceptedResponse {
 	b, x := &b0, m0
 	_, _ = b, x
 	x.xxx_hidden_AcceptorId = b.AcceptorId
+	x.xxx_hidden_Instance = b.Instance
 	x.xxx_hidden_Accepted = b.Accepted
 	x.xxx_hidden_ProposalNum = b.ProposalNum
 	return m0
@@ -368,9 +424,10 @@ func (b0 AcceptedResponse_builder) Build() *AcceptedResponse {
 // LearnRequest notifies learners of chosen value.
 type LearnRequest struct {
 	state                  protoimpl.MessageState `protogen:"opaque.v1"`
-	xxx_hidden_ProposalNum uint32                 `protobuf:"varint,1,opt,name=proposal_num,json=proposalNum"`
-	xxx_hidden_Value       string                 `protobuf:"bytes,2,opt,name=value"`
-	xxx_hidden_ProposerId  uint32                 `protobuf:"varint,3,opt,name=proposer_id,json=proposerId"`
+	xxx_hidden_Instance    uint32                 `protobuf:"varint,1,opt,name=instance"`
+	xxx_hidden_ProposalNum uint32                 `protobuf:"varint,2,opt,name=proposal_num,json=proposalNum"`
+	xxx_hidden_Value       string                 `protobuf:"bytes,3,opt,name=value"`
+	xxx_hidden_ProposerId  uint32                 `protobuf:"varint,4,opt,name=proposer_id,json=proposerId"`
 	unknownFields          protoimpl.UnknownFields
 	sizeCache              protoimpl.SizeCache
 }
@@ -400,6 +457,13 @@ func (x *LearnRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
+func (x *LearnRequest) GetInstance() uint32 {
+	if x != nil {
+		return x.xxx_hidden_Instance
+	}
+	return 0
+}
+
 func (x *LearnRequest) GetProposalNum() uint32 {
 	if x != nil {
 		return x.xxx_hidden_ProposalNum
@@ -421,6 +485,10 @@ func (x *LearnRequest) GetProposerId() uint32 {
 	return 0
 }
 
+func (x *LearnRequest) SetInstance(v uint32) {
+	x.xxx_hidden_Instance = v
+}
+
 func (x *LearnRequest) SetProposalNum(v uint32) {
 	x.xxx_hidden_ProposalNum = v
 }
@@ -436,6 +504,7 @@ func (x *LearnRequest) SetProposerId(v uint32) {
 type LearnRequest_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
+	Instance    uint32
 	ProposalNum uint32
 	Value       string
 	ProposerId  uint32
@@ -445,6 +514,7 @@ func (b0 LearnRequest_builder) Build() *LearnRequest {
 	m0 := &LearnRequest{}
 	b, x := &b0, m0
 	_, _ = b, x
+	x.xxx_hidden_Instance = b.Instance
 	x.xxx_hidden_ProposalNum = b.ProposalNum
 	x.xxx_hidden_Value = b.Value
 	x.xxx_hidden_ProposerId = b.ProposerId
@@ -455,7 +525,8 @@ func (b0 LearnRequest_builder) Build() *LearnRequest {
 type LearnResponse struct {
 	state                protoimpl.MessageState `protogen:"opaque.v1"`
 	xxx_hidden_LearnerId uint32                 `protobuf:"varint,1,opt,name=learner_id,json=learnerId"`
-	xxx_hidden_Learned   bool                   `protobuf:"varint,2,opt,name=learned"`
+	xxx_hidden_Instance  uint32                 `protobuf:"varint,2,opt,name=instance"`
+	xxx_hidden_Learned   bool                   `protobuf:"varint,3,opt,name=learned"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -492,6 +563,13 @@ func (x *LearnResponse) GetLearnerId() uint32 {
 	return 0
 }
 
+func (x *LearnResponse) GetInstance() uint32 {
+	if x != nil {
+		return x.xxx_hidden_Instance
+	}
+	return 0
+}
+
 func (x *LearnResponse) GetLearned() bool {
 	if x != nil {
 		return x.xxx_hidden_Learned
@@ -503,6 +581,10 @@ func (x *LearnResponse) SetLearnerId(v uint32) {
 	x.xxx_hidden_LearnerId = v
 }
 
+func (x *LearnResponse) SetInstance(v uint32) {
+	x.xxx_hidden_Instance = v
+}
+
 func (x *LearnResponse) SetLearned(v bool) {
 	x.xxx_hidden_Learned = v
 }
@@ -511,6 +593,7 @@ type LearnResponse_builder struct {
 	_ [0]func() // Prevents comparability and use of unkeyed literals for the builder.
 
 	LearnerId uint32
+	Instance  uint32
 	Learned   bool
 }
 
@@ -519,6 +602,7 @@ func (b0 LearnResponse_builder) Build() *LearnResponse {
 	b, x := &b0, m0
 	_, _ = b, x
 	x.xxx_hidden_LearnerId = b.LearnerId
+	x.xxx_hidden_Instance = b.Instance
 	x.xxx_hidden_Learned = b.Learned
 	return m0
 }
@@ -527,36 +611,42 @@ var File_paxos_proto_paxos_proto protoreflect.FileDescriptor
 
 const file_paxos_proto_paxos_proto_rawDesc = "" +
 	"\n" +
-	"\x17paxos/proto/paxos.proto\x12\x05paxos\x1a\fgorums.proto\"T\n" +
-	"\x0ePrepareRequest\x12!\n" +
-	"\fproposal_num\x18\x01 \x01(\rR\vproposalNum\x12\x1f\n" +
-	"\vproposer_id\x18\x02 \x01(\rR\n" +
-	"proposerId\"\xa9\x01\n" +
+	"\x17paxos/proto/paxos.proto\x12\x05paxos\x1a\fgorums.proto\"p\n" +
+	"\x0ePrepareRequest\x12\x1a\n" +
+	"\binstance\x18\x01 \x01(\rR\binstance\x12!\n" +
+	"\fproposal_num\x18\x02 \x01(\rR\vproposalNum\x12\x1f\n" +
+	"\vproposer_id\x18\x03 \x01(\rR\n" +
+	"proposerId\"\xc5\x01\n" +
 	"\x0fPromiseResponse\x12\x1f\n" +
 	"\vacceptor_id\x18\x01 \x01(\rR\n" +
 	"acceptorId\x12\x1a\n" +
-	"\bpromised\x18\x02 \x01(\bR\bpromised\x122\n" +
-	"\x15accepted_proposal_num\x18\x03 \x01(\rR\x13acceptedProposalNum\x12%\n" +
-	"\x0eaccepted_value\x18\x04 \x01(\tR\racceptedValue\"i\n" +
-	"\rAcceptRequest\x12!\n" +
-	"\fproposal_num\x18\x01 \x01(\rR\vproposalNum\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value\x12\x1f\n" +
-	"\vproposer_id\x18\x03 \x01(\rR\n" +
-	"proposerId\"r\n" +
+	"\binstance\x18\x02 \x01(\rR\binstance\x12\x1a\n" +
+	"\bpromised\x18\x03 \x01(\bR\bpromised\x122\n" +
+	"\x15accepted_proposal_num\x18\x04 \x01(\rR\x13acceptedProposalNum\x12%\n" +
+	"\x0eaccepted_value\x18\x05 \x01(\tR\racceptedValue\"\x85\x01\n" +
+	"\rAcceptRequest\x12\x1a\n" +
+	"\binstance\x18\x01 \x01(\rR\binstance\x12!\n" +
+	"\fproposal_num\x18\x02 \x01(\rR\vproposalNum\x12\x14\n" +
+	"\x05value\x18\x03 \x01(\tR\x05value\x12\x1f\n" +
+	"\vproposer_id\x18\x04 \x01(\rR\n" +
+	"proposerId\"\x8e\x01\n" +
 	"\x10AcceptedResponse\x12\x1f\n" +
 	"\vacceptor_id\x18\x01 \x01(\rR\n" +
 	"acceptorId\x12\x1a\n" +
-	"\baccepted\x18\x02 \x01(\bR\baccepted\x12!\n" +
-	"\fproposal_num\x18\x03 \x01(\rR\vproposalNum\"h\n" +
-	"\fLearnRequest\x12!\n" +
-	"\fproposal_num\x18\x01 \x01(\rR\vproposalNum\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value\x12\x1f\n" +
-	"\vproposer_id\x18\x03 \x01(\rR\n" +
-	"proposerId\"H\n" +
+	"\binstance\x18\x02 \x01(\rR\binstance\x12\x1a\n" +
+	"\baccepted\x18\x03 \x01(\bR\baccepted\x12!\n" +
+	"\fproposal_num\x18\x04 \x01(\rR\vproposalNum\"\x84\x01\n" +
+	"\fLearnRequest\x12\x1a\n" +
+	"\binstance\x18\x01 \x01(\rR\binstance\x12!\n" +
+	"\fproposal_num\x18\x02 \x01(\rR\vproposalNum\x12\x14\n" +
+	"\x05value\x18\x03 \x01(\tR\x05value\x12\x1f\n" +
+	"\vproposer_id\x18\x04 \x01(\rR\n" +
+	"proposerId\"d\n" +
 	"\rLearnResponse\x12\x1d\n" +
 	"\n" +
-	"learner_id\x18\x01 \x01(\rR\tlearnerId\x12\x18\n" +
-	"\alearned\x18\x02 \x01(\bR\alearned2\xc0\x01\n" +
+	"learner_id\x18\x01 \x01(\rR\tlearnerId\x12\x1a\n" +
+	"\binstance\x18\x02 \x01(\rR\binstance\x12\x18\n" +
+	"\alearned\x18\x03 \x01(\bR\alearned2\xc0\x01\n" +
 	"\x05Paxos\x12>\n" +
 	"\aPrepare\x12\x15.paxos.PrepareRequest\x1a\x16.paxos.PromiseResponse\"\x04\xa0\xb5\x18\x01\x12=\n" +
 	"\x06Accept\x12\x14.paxos.AcceptRequest\x1a\x17.paxos.AcceptedResponse\"\x04\xa0\xb5\x18\x01\x128\n" +
