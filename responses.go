@@ -5,10 +5,36 @@ import (
 	"iter"
 
 	"google.golang.org/protobuf/proto"
+
+	"github.com/relab/gorums/internal/stream"
 )
 
 // msg is a type alias for proto.Message intended to be used as a type parameter.
 type msg = proto.Message
+
+// NodeResponse is a type alias for stream.NodeResponse.
+type NodeResponse[T any] = stream.NodeResponse[T]
+
+// mapToCallResponse converts a NodeResponse[*stream.Message] to a NodeResponse[Resp].
+// This is necessary because the channel layer's response router returns a
+// NodeResponse[*stream.Message] while the calltype expects a NodeResponse[Resp].
+func mapToCallResponse[Resp msg](channelResp NodeResponse[*stream.Message]) NodeResponse[Resp] {
+	callResp := NodeResponse[Resp]{
+		NodeID: channelResp.NodeID,
+		Err:    channelResp.Err,
+	}
+	if channelResp.Err == nil {
+		respMsg, err := unmarshalResponse(channelResp.Value)
+		if err != nil {
+			callResp.Err = err
+		} else if val, ok := respMsg.(Resp); ok {
+			callResp.Value = val
+		} else {
+			callResp.Err = ErrTypeMismatch
+		}
+	}
+	return callResp
+}
 
 // -------------------------------------------------------------------------
 // Iterator Helpers

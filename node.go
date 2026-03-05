@@ -6,10 +6,13 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+
+	"github.com/relab/gorums/internal/stream"
 )
 
 const nilAngleString = "<nil>"
@@ -28,9 +31,10 @@ func (c NodeContext) Node() *Node {
 	return c.node
 }
 
-// enqueue enqueues a request to this node's channel.
-func (c NodeContext) enqueue(req request) {
-	c.node.channel.enqueue(req)
+// enqueue enqueues a request to this node's channel. If the channel is nil,
+// e.g., for the self-node, the request is silently dropped.
+func (c NodeContext) enqueue(req stream.Request) {
+	c.node.Enqueue(req)
 }
 
 // nextMsgID returns the next message ID from this client's manager.
@@ -47,7 +51,8 @@ type Node struct {
 	mgr  *Manager // only used for backward compatibility to allow Configuration.Manager()
 
 	msgIDGen func() uint64
-	channel  *channel
+	router   *stream.MessageRouter
+	channel  atomic.Pointer[stream.Channel]
 }
 
 // Context creates a new NodeContext from the given parent context
@@ -72,11 +77,12 @@ type nodeOptions struct {
 	Metadata       metadata.MD
 	PerNodeMD      func(uint32) metadata.MD
 	DialOpts       []grpc.DialOption
+	RequestHandler stream.RequestHandler
 	Manager        *Manager // only used for backward compatibility to allow Configuration.Manager()
 }
 
-// newNode creates a new node using the provided options.
-// It establishes the connection (lazy dial) and initializes the channel.
+// newNode creates a new node using the provided options. It establishes
+// the connection (lazy dial) and initializes the outbound channel.
 func newNode(addr string, opts nodeOptions) (*Node, error) {
 	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
@@ -88,6 +94,7 @@ func newNode(addr string, opts nodeOptions) (*Node, error) {
 		addr:     tcpAddr.String(),
 		mgr:      opts.Manager,
 		msgIDGen: opts.MsgIDGen,
+		router:   stream.NewMessageRouter(opts.RequestHandler),
 	}
 
 	// Create gRPC connection to the node without connecting (lazy dial).
@@ -103,15 +110,68 @@ func newNode(addr string, opts nodeOptions) (*Node, error) {
 	}
 	ctx := metadata.NewOutgoingContext(context.Background(), md)
 
-	// Create channel and establish gRPC node stream
-	n.channel = newChannel(ctx, conn, n.id, opts.SendBufferSize)
+	// Create new outbound channel and establish gRPC node stream
+	n.channel.Store(stream.NewOutboundChannel(ctx, n.id, opts.SendBufferSize, conn, n.router))
 	return n, nil
 }
 
+// newPeerNode creates a Node for a known peer or self without an active
+// channel. Used by InboundManager at construction time for all configured
+// peers; the channel is attached when the peer's stream arrives.
+func newPeerNode(id uint32, addr string, msgIDGen func() uint64) *Node {
+	return &Node{
+		id:       id,
+		addr:     addr,
+		msgIDGen: msgIDGen,
+		router:   stream.NewMessageRouter(),
+	}
+}
+
+// attachStream attaches a new inbound channel to the node when a peer connects.
+// If the node already has an active channel (e.g., a stale stream from a previous
+// connection), it is atomically replaced and the old channel is closed.
+func (n *Node) attachStream(streamCtx context.Context, inboundStream stream.BidiStream, sendBufferSize uint) {
+	newCh := stream.NewInboundChannel(streamCtx, n.id, sendBufferSize, inboundStream, n.router)
+	if old := n.channel.Swap(newCh); old != nil {
+		old.Close()
+	}
+}
+
+// detachStream closes and removes the node's inbound channel when the peer disconnects.
+func (n *Node) detachStream() {
+	if ch := n.channel.Swap(nil); ch != nil {
+		ch.Close()
+	}
+}
+
+// RouteResponse routes an incoming message as a response to a pending
+// server-initiated call. Returns true if the message matched a pending
+// call and was handled; false if it should be dispatched as a new request.
+// This implements the [stream.PeerNode] interface.
+func (n *Node) RouteResponse(msg *stream.Message) bool {
+	return n.router.RouteResponse(msg.GetMessageSeqNo(), NodeResponse[*stream.Message]{
+		NodeID: n.id,
+		Value:  msg,
+		Err:    msg.ErrorStatus(),
+	})
+}
+
+// Enqueue enqueues a request to this node's channel. If the channel is nil,
+// e.g., for the self-node, the request is silently dropped.
+// This implements the [stream.PeerNode] interface.
+func (n *Node) Enqueue(req stream.Request) {
+	if ch := n.channel.Load(); ch != nil {
+		ch.Enqueue(req)
+	}
+}
+
+// compile-time assertion that Node implements the PeerNode interface.
+var _ stream.PeerNode = (*Node)(nil)
+
 // close this node.
 func (n *Node) close() error {
-	if n.channel != nil {
-		return n.channel.close()
+	if ch := n.channel.Load(); ch != nil {
+		return ch.Close()
 	}
 	return nil
 }
@@ -168,12 +228,15 @@ func (n *Node) FullString() string {
 
 // LastErr returns the last error encountered (if any) for this node.
 func (n *Node) LastErr() error {
-	return n.channel.lastErr()
+	if ch := n.channel.Load(); ch != nil {
+		return ch.LastErr()
+	}
+	return nil
 }
 
 // Latency returns the latency between the client and this node.
 func (n *Node) Latency() time.Duration {
-	return n.channel.channelLatency()
+	return n.router.Latency()
 }
 
 type lessFunc func(n1, n2 *Node) bool
@@ -251,7 +314,7 @@ var Port = func(n1, n2 *Node) bool {
 // LastNodeError sorts nodes by their LastErr() status in increasing order. A
 // node with LastErr() != nil is larger than a node with LastErr() == nil.
 var LastNodeError = func(n1, n2 *Node) bool {
-	if n1.channel.lastErr() != nil && n2.channel.lastErr() == nil {
+	if n1.LastErr() != nil && n2.LastErr() == nil {
 		return false
 	}
 	return true

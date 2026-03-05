@@ -31,6 +31,33 @@ func (s *System) Addr() string {
 	return s.lis.Addr().String()
 }
 
+// Config returns the Configuration of all currently connected known peers.
+// Returns nil if no peer tracking is configured.
+func (s *System) Config() Configuration {
+	return s.srv.Config()
+}
+
+// ClientConfig returns a [Configuration] of all connected client peers.
+// The returned slice is replaced atomically on each connect/disconnect;
+// retaining a reference to an old value is safe.
+// Returns nil if no peer tracking is configured.
+func (s *System) ClientConfig() Configuration {
+	return s.srv.ClientConfig()
+}
+
+// NewOutboundConfig creates an outbound [Configuration] for connecting to peers.
+// When peer tracking / symmetric configuration is enabled, it automatically
+// includes this system's NodeID in the connection metadata, enabling the
+// remote server to identify this replica.
+func (s *System) NewOutboundConfig(opts ...Option) (Configuration, error) {
+	if s.srv.inboundMgr == nil {
+		return NewConfig(opts...)
+	}
+	return NewConfig(append([]Option{
+		withRequestHandler(s.srv, s.srv.inboundMgr.myID),
+	}, opts...)...)
+}
+
 // RegisterService registers the service with the server using the provided register function.
 // The closer is added to the list of closers to be closed when the system is stopped.
 //

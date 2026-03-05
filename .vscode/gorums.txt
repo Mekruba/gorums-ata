@@ -1,5 +1,6 @@
 Ansible
 benchgraph
+benchmem
 benchtest
 benchtime
 bootstrapgorums
@@ -10,6 +11,8 @@ checkf
 clevel
 compiletests
 cpuprofile
+dedup
+demultiplexing
 descriptorpb
 devel
 devguide
@@ -56,6 +59,7 @@ Meling
 memprofile
 mktemp
 multicast
+multicasts
 naddr
 netrwhist
 obj's
@@ -111,6 +115,7 @@ unmarshal
 unmarshaled
 unmarshaling
 unmarshals
+unregistrations
 userguide
 wrapperspb
 Xeon

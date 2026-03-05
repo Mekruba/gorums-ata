@@ -7,10 +7,18 @@ import (
 	"slices"
 )
 
-// NodeListOption must be implemented by node providers.
+// NodeListOption must be implemented by node providers. It is used by both the
+// Manager (outbound) and by InboundManager (inbound) via newConfig.
 type NodeListOption interface {
 	Option
-	newConfig(*Manager) (Configuration, error)
+	newConfig(nodeRegistry) (Configuration, error)
+}
+
+// nodeRegistry abstracts the node management operations required to build a Configuration.
+// Implemented by Manager and InboundManager.
+type nodeRegistry interface {
+	Nodes() []*Node
+	newNode(id uint32, addr string) (*Node, error)
 }
 
 // NodeAddress must be implemented by types that can be used as node addresses.
@@ -29,25 +37,15 @@ type nodeMap[T NodeAddress] map[uint32]T
 
 func (nodeMap[T]) isOption() {}
 
-func (nm nodeMap[T]) newConfig(mgr *Manager) (Configuration, error) {
+func (nm nodeMap[T]) newConfig(registry nodeRegistry) (Configuration, error) {
 	if len(nm) == 0 {
 		return nil, fmt.Errorf("config: missing required node map")
 	}
-	builder := newNodeBuilder(mgr, len(nm))
+	builder := newNodeBuilder(registry, len(nm))
 	// Sort IDs to ensure deterministic processing order
 	for _, id := range slices.Sorted(maps.Keys(nm)) {
-		if id == 0 {
-			return nil, fmt.Errorf("config: node 0 is reserved")
-		}
 		node := nm[id]
-		// Check if ID already exists in manager
-		if _, found := mgr.Node(id); found {
-			if err := builder.addExisting(id, node.Addr()); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if err := builder.addNew(id, node.Addr()); err != nil {
+		if err := builder.add(id, node.Addr()); err != nil {
 			return nil, err
 		}
 	}
@@ -55,7 +53,9 @@ func (nm nodeMap[T]) newConfig(mgr *Manager) (Configuration, error) {
 }
 
 // WithNodeList returns a NodeListOption for the provided list of node addresses.
-// Unique Node IDs are generated preventing conflicts with existing nodes.
+// Unique Node IDs are generated sequentially starting from the maximum existing
+// node ID plus one, or from 1 if no nodes exist, preventing conflicts with
+// existing nodes.
 func WithNodeList(addrsList []string) NodeListOption {
 	return nodeList(addrsList)
 }
@@ -64,15 +64,15 @@ type nodeList []string
 
 func (nodeList) isOption() {}
 
-func (nl nodeList) newConfig(mgr *Manager) (Configuration, error) {
+func (nl nodeList) newConfig(registry nodeRegistry) (Configuration, error) {
 	if len(nl) == 0 {
 		return nil, fmt.Errorf("config: missing required node addresses")
 	}
-	builder := newNodeBuilder(mgr, len(nl))
+	builder := newNodeBuilder(registry, len(nl))
 	nextID := builder.nextID()
 	for i, addr := range nl {
 		id := nextID + uint32(i)
-		if err := builder.addNew(id, addr); err != nil {
+		if err := builder.add(id, addr); err != nil {
 			return nil, err
 		}
 	}
@@ -82,47 +82,36 @@ func (nl nodeList) newConfig(mgr *Manager) (Configuration, error) {
 // nodeBuilder helps construct a Configuration while tracking addresses to prevent duplicates.
 // It encapsulates the common logic shared between WithNodes and WithNodeList.
 type nodeBuilder struct {
-	mgr      *Manager
+	registry nodeRegistry
 	addrToID map[string]uint32 // normalized address -> node ID
+	idToNode map[uint32]*Node  // existing node ID -> node
+	maxID    uint32            // maximum existing node ID
 	nodes    Configuration
 }
 
-// newNodeBuilder creates a new nodeBuilder initialized with existing nodes from the manager.
-func newNodeBuilder(mgr *Manager, capacity int) *nodeBuilder {
+// newNodeBuilder creates a new nodeBuilder initialized with existing nodes from the registry.
+func newNodeBuilder(registry nodeRegistry, capacity int) *nodeBuilder {
 	addrToID := make(map[string]uint32, capacity)
-	// Populate with existing nodes from the manager (already normalized)
-	for _, existingNode := range mgr.Nodes() {
-		addrToID[existingNode.Address()] = existingNode.ID()
+	idToNode := make(map[uint32]*Node, capacity)
+	maxID := uint32(0)
+	// Populate with existing nodes from the registry (already normalized)
+	for _, existingNode := range registry.Nodes() {
+		id := existingNode.ID()
+		addrToID[existingNode.Address()] = id
+		idToNode[id] = existingNode
+		maxID = max(maxID, id)
 	}
 	return &nodeBuilder{
-		mgr:      mgr,
+		registry: registry,
 		addrToID: addrToID,
+		idToNode: idToNode,
+		maxID:    maxID,
 		nodes:    make(Configuration, 0, capacity),
 	}
 }
 
-// addExisting adds an existing node (already in manager) to the configuration.
-// Returns an error if the ID exists but with a different address.
-func (b *nodeBuilder) addExisting(id uint32, addr string) error {
-	normalizedAddr, err := normalizeAddr(addr)
-	if err != nil {
-		return fmt.Errorf("config: invalid address %q: %w", addr, err)
-	}
-	existingNode, found := b.mgr.Node(id)
-	if !found {
-		return fmt.Errorf("config: node %d not found in manager", id)
-	}
-	if existingNode.Address() != normalizedAddr {
-		return fmt.Errorf("config: node %d already in use", id)
-	}
-	b.nodes = append(b.nodes, existingNode)
-	return nil
-}
-
-// addNew creates and adds a new node with the given ID and address.
-// Returns an error if the ID is reserved (0), if the address is invalid,
-// or if the normalized address is already in use.
-func (b *nodeBuilder) addNew(id uint32, addr string) error {
+// add creates or reuses a node with the given ID and address.
+func (b *nodeBuilder) add(id uint32, addr string) error {
 	if id == 0 {
 		return fmt.Errorf("config: node 0 is reserved")
 	}
@@ -130,12 +119,23 @@ func (b *nodeBuilder) addNew(id uint32, addr string) error {
 	if err != nil {
 		return fmt.Errorf("config: invalid address %q: %w", addr, err)
 	}
+
+	// If ID already exists, verify address matches
+	if existingNode, found := b.idToNode[id]; found {
+		if existingNode.Address() != normalizedAddr {
+			return fmt.Errorf("config: node %d already in use by %q", id, existingNode.Address())
+		}
+		b.nodes = append(b.nodes, existingNode)
+		return nil
+	}
+
 	// Check for duplicate address
 	if existingID, exists := b.addrToID[normalizedAddr]; exists {
 		return fmt.Errorf("config: address %q already in use by node %d", normalizedAddr, existingID)
 	}
+
 	b.addrToID[normalizedAddr] = id
-	node, err := b.mgr.newNode(addr, id)
+	node, err := b.registry.newNode(id, normalizedAddr)
 	if err != nil {
 		return err
 	}
@@ -145,17 +145,13 @@ func (b *nodeBuilder) addNew(id uint32, addr string) error {
 
 // configuration returns the built Configuration, sorted by ID.
 func (b *nodeBuilder) configuration() Configuration {
-	OrderedBy(ID).Sort(b.mgr.nodes)
 	OrderedBy(ID).Sort(b.nodes)
 	return b.nodes
 }
 
 // nextID returns the next available node ID (max existing ID + 1).
 func (b *nodeBuilder) nextID() uint32 {
-	if nodeIDs := b.mgr.NodeIDs(); len(nodeIDs) > 0 {
-		return slices.Max(nodeIDs) + 1
-	}
-	return 1
+	return b.maxID + 1
 }
 
 // normalizeAddr normalizes an address string to a canonical form using

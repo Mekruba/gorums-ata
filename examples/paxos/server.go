@@ -266,11 +266,11 @@ func (p *PaxosServer) Learn(ctx gorums.ServerCtx, req *pb.LearnRequest) (*pb.Lea
 }
 
 // broadcastLearn broadcasts learned value to other nodes.
-func (p *PaxosServer) broadcastLearn(cfg *gorums.Configuration, req *pb.LearnRequest) {
+func (p *PaxosServer) broadcastLearn(cfg gorums.Configuration, req *pb.LearnRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	cfgCtx := (*cfg).Context(ctx)
+	cfgCtx := cfg.Context(ctx)
 	learned := pb.Learn(cfgCtx, req)
 
 	for learn := range learned.Seq() {

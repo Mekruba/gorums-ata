@@ -3,112 +3,25 @@ package gorums
 import (
 	"context"
 	"net"
-	"sync"
 
 	"github.com/relab/gorums/internal/stream"
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/proto"
 )
 
-type (
-	// Interceptor is a function that can intercept and modify incoming requests
-	// and outgoing responses. It receives a ServerCtx, the incoming Message, and
-	// a Handler representing the next element in the chain (either another
-	// Interceptor or the actual server method). It returns a Message and an error.
-	Interceptor func(ServerCtx, *Message, Handler) (*Message, error)
-	// Handler is a function that processes a request and returns a response.
-	Handler func(ServerCtx, *Message) (*Message, error)
-)
-
-type streamServer struct {
-	handlers map[string]Handler
-	opts     *serverOptions
-	stream.UnimplementedGorumsServer
-	config *Configuration
-}
-
-func newStreamServer(opts *serverOptions) *streamServer {
-	return &streamServer{
-		handlers: make(map[string]Handler),
-		opts:     opts,
-		config:   opts.configuration,
-	}
-}
-
-// NodeStream handles a connection to a single client. The stream is aborted if there
-// is any error with sending or receiving.
-func (s *streamServer) NodeStream(srv stream.Gorums_NodeStreamServer) error {
-	var mut sync.Mutex // used to achieve mutex between request handlers
-	finished := make(chan *stream.Message, s.opts.buffer)
-	ctx := srv.Context()
-
-	if s.opts.connectCallback != nil {
-		s.opts.connectCallback(ctx)
-	}
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case streamOut := <-finished:
-				if err := srv.Send(streamOut); err != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	// Start with a locked mutex
-	mut.Lock()
-	defer mut.Unlock()
-
-	for {
-		streamIn, err := srv.Recv()
-		if err != nil {
-			return err
-		}
-		if handler, ok := s.handlers[streamIn.GetMethod()]; ok {
-			// We start the handler in a new goroutine in order to allow multiple handlers to run concurrently.
-			// However, to preserve request ordering, the handler must unlock the shared mutex when it has either
-			// finished, or when it is safe to start processing the next request.
-			//
-			// This func() is the default interceptor; it is the first and last handler in the chain.
-			// It is responsible for releasing the mutex when the handler chain is done.
-			go func() {
-				srvCtx := newServerCtx(streamIn.AppendToIncomingContext(ctx), &mut, finished, s.config)
-				defer srvCtx.Release()
-
-				msg, err := unmarshalRequest(streamIn)
-				in := &Message{Msg: msg, Message: streamIn}
-				if err != nil {
-					_ = srvCtx.SendMessage(messageWithError(in, nil, err))
-					return
-				}
-
-				out, err := handler(srvCtx, in)
-				// If there is no response and no error, we do not send anything back to the client.
-				// This corresponds to a unidirectional message from client to server, where clients
-				// are not expected to receive a response.
-				if out == nil && err == nil {
-					return
-				}
-				_ = srvCtx.SendMessage(messageWithError(in, out, err))
-				// We ignore the error from SendMessage here; it means that the stream is closed.
-				// The for-loop above will exit on the next Recv call.
-			}()
-			// Wait until the handler releases the mutex.
-			mut.Lock()
-		}
-	}
-}
-
+// serverOptions contains configuration options for creating a new Server.
 type serverOptions struct {
 	buffer          uint
 	grpcOpts        []grpc.ServerOption
 	connectCallback func(context.Context)
 	interceptors    []Interceptor
 	configuration   *Configuration
+	// Peer management options (create InboundManager internally)
+	myID            uint32
+	peerOpt         NodeListOption
+	clientPeers     bool
+	peerSendBuffer  uint
+	onConfigChange  func(Configuration)
+	onClientsChange func(Configuration)
 }
 
 // ServerOption is used to change settings for the GorumsServer
@@ -158,52 +71,153 @@ func WithInterceptors(i ...Interceptor) ServerOption {
 	}
 }
 
-// chainInterceptors composes the provided interceptors around the final Handler and
-// returns a Handler that executes the chain. The execution order is the same as the
-// order of the interceptors in the slice: the first element is executed first, and
-// the last element calls the final handler (the server method).
-func chainInterceptors(final Handler, interceptors ...Interceptor) Handler {
-	if len(interceptors) == 0 {
-		return final
-	}
-	handler := final
-	for i := len(interceptors) - 1; i >= 0; i-- {
-		curr := interceptors[i]
-		next := handler
-		handler = func(ctx ServerCtx, in *Message) (*Message, error) {
-			return curr(ctx, in, next)
+// WithConfig configures the server to track known peer servers identified by their
+// NodeID metadata. When a server connects as a client with a recognized NodeID, the
+// server registers the node and includes it in the [Configuration] returned by [Config].
+// The myID parameter is this server's own NodeID; it is always present in the [Config]
+// so that quorum thresholds account for the local replica.
+// The optional onChange callback is called after each change to the known peer [Configuration]
+// (server peer connect or disconnect). It is invoked while the manager's lock is held,
+// so it must not call [Config] or other blocking methods.
+// Use it only to signal or copy; do not perform long work inside the callback.
+func WithConfig(myID uint32, opt NodeListOption, onChange ...func(Configuration)) ServerOption {
+	return func(o *serverOptions) {
+		o.myID = myID
+		o.peerOpt = opt
+		if len(onChange) > 0 {
+			o.onConfigChange = onChange[0]
 		}
 	}
-	return handler
+}
+
+// WithClientConfig enables the server to accept unknown clients (those without
+// a recognized NodeID). Each unknown client is assigned a sequential auto-generated
+// ID and included in the [Configuration] returned by [ClientConfig]. Client nodes are
+// removed when they disconnect. Can be combined with [WithConfig] for mixed mode.
+// The optional onChange callback is called after each change to the [ClientConfig]
+// (client peer connect or disconnect). It is invoked while the manager's lock is held,
+// so it must not call [ClientConfig] or other blocking methods.
+// Use it only to signal or copy; do not perform long work inside the callback.
+func WithClientConfig(onChange ...func(Configuration)) ServerOption {
+	return func(o *serverOptions) {
+		o.clientPeers = true
+		if len(onChange) > 0 {
+			o.onClientsChange = onChange[0]
+		}
+	}
+}
+
+// WithPeerSendBufferSize sets the size of the per-node send buffer for channels
+// created when inbound peers connect. A larger buffer may increase throughput
+// for asynchronous call types at the cost of latency. The default is 0 (unbuffered).
+func WithPeerSendBufferSize(size uint) ServerOption {
+	return func(o *serverOptions) {
+		o.peerSendBuffer = size
+	}
 }
 
 // Server serves all ordering based RPCs using registered handlers.
 type Server struct {
-	srv          *streamServer
+	srv          *stream.Server
 	grpcServer   *grpc.Server
+	handlers     map[string]Handler
 	interceptors []Interceptor
+	inboundMgr   *InboundManager // nil if no peers configured
+	staticConfig *Configuration  // static configuration passed via WithConfiguration
 }
 
-// NewServer returns a new instance of [gorums.Server].
+// NewServer returns a new instance of [Server].
+// If [WithConfig] or [WithClientConfig] options are provided, an InboundManager is
+// created internally to track connected peers.
+// Panics on configuration errors (invalid addresses, duplicate nodes, etc.)
+// since these are programmer errors detectable at startup.
 func NewServer(opts ...ServerOption) *Server {
 	var serverOpts serverOptions
 	for _, opt := range opts {
 		opt(&serverOpts)
 	}
-	s := &Server{
-		srv:          newStreamServer(&serverOpts),
-		grpcServer:   grpc.NewServer(serverOpts.grpcOpts...),
-		interceptors: serverOpts.interceptors,
+	var acceptor *InboundManager
+	if serverOpts.peerOpt != nil || serverOpts.clientPeers {
+		acceptor = newInboundManager(serverOpts.myID, serverOpts.peerOpt, serverOpts.peerSendBuffer, serverOpts.onConfigChange, serverOpts.onClientsChange, serverOpts.clientPeers)
 	}
+	s := &Server{
+		grpcServer:   grpc.NewServer(serverOpts.grpcOpts...),
+		handlers:     make(map[string]Handler),
+		interceptors: serverOpts.interceptors,
+		inboundMgr:   acceptor,
+		staticConfig: serverOpts.configuration,
+	}
+	s.srv = stream.NewServer(serverOpts.buffer, acceptor, serverOpts.connectCallback, s)
 	stream.RegisterGorumsServer(s.grpcServer, s.srv)
 	return s
+}
+
+// Config returns a [Configuration] of all connected known peers, plus this node.
+// The returned slice is replaced atomically on each connect/disconnect;
+// retaining a reference to an old configuration is safe.
+// Returns nil if no peer tracking is configured.
+func (s *Server) Config() Configuration {
+	if s.inboundMgr == nil {
+		return nil
+	}
+	return s.inboundMgr.Config()
+}
+
+// ClientConfig returns a [Configuration] of all connected client peers.
+// The returned slice is replaced atomically on each connect/disconnect;
+// retaining a reference to an old value is safe.
+// Returns nil if no peer tracking is configured.
+func (s *Server) ClientConfig() Configuration {
+	if s.inboundMgr == nil {
+		return nil
+	}
+	return s.inboundMgr.ClientConfig()
 }
 
 // RegisterHandler registers a request handler for the specified method name.
 //
 // This function should only be used by generated code.
 func (s *Server) RegisterHandler(method string, handler Handler) {
-	s.srv.handlers[method] = chainInterceptors(handler, s.interceptors...)
+	s.handlers[method] = chainInterceptors(handler, s.interceptors...)
+}
+
+// HandleRequest processes an incoming request from the stream, dispatching it
+// to the appropriate registered handler. It serves as the bridge between the
+// multiplexing in the stream package and the RPC logic in the gorums package.
+//
+// This is the "default interceptor"; it is the first and last handler in the chain.
+// It is responsible for releasing the mutex when the handler chain is done,
+// unless already released by the handler itself, or an interceptor in the chain.
+func (s *Server) HandleRequest(ctx context.Context, reqMsg *stream.Message, release func(), send func(*stream.Message)) {
+	srvCtx := ServerCtx{
+		Context: ctx,
+		release: release,
+		send:    send,
+		srv:     s,
+	}
+	defer srvCtx.Release()
+
+	handler, ok := s.handlers[reqMsg.GetMethod()]
+	if !ok {
+		// No handler registered: we just ignore the message and release the lock.
+		return
+	}
+
+	msg, err := unmarshalRequest(reqMsg)
+	in := &Message{Msg: msg, Message: reqMsg}
+	if err != nil {
+		_ = srvCtx.SendMessage(MessageWithError(in, nil, err))
+		return
+	}
+
+	out, err := handler(srvCtx, in)
+	// If there is no response and no error, we do not send anything back to the client.
+	// This corresponds to a unidirectional message from client to server, where clients
+	// are not expected to receive a response.
+	if out == nil && err == nil {
+		return
+	}
+	_ = srvCtx.SendMessage(MessageWithError(in, out, err))
 }
 
 // Serve starts serving on the listener.
@@ -219,60 +233,4 @@ func (s *Server) GracefulStop() {
 // Stop stops the server immediately.
 func (s *Server) Stop() {
 	s.grpcServer.Stop()
-}
-
-// ServerCtx is a context that is passed from the Gorums server to the handler.
-// It allows the handler to release its lock on the server, allowing the next request to be processed.
-// This happens automatically when the handler returns.
-type ServerCtx struct {
-	context.Context
-	config *Configuration
-	once   *sync.Once // must be a pointer to avoid passing ctx by value
-	mut    *sync.Mutex
-	c      chan<- *stream.Message
-}
-
-// newServerCtx creates a new ServerCtx with the given context, mutex and metadata channel.
-func newServerCtx(ctx context.Context, mut *sync.Mutex, c chan<- *stream.Message, config *Configuration) ServerCtx {
-	return ServerCtx{
-		Context: ctx,
-		config:  config,
-		once:    new(sync.Once),
-		mut:     mut,
-		c:       c,
-	}
-}
-
-// Release releases this handler's lock on the server, which allows the next request
-// to be processed concurrently. Use Release only when the handler no longer needs
-// exclusive access to the server's state. It is safe to call Release multiple times.
-func (ctx *ServerCtx) Release() {
-	ctx.once.Do(ctx.mut.Unlock)
-}
-
-// Nil-safe accessor to the Nodes
-func (ctx *ServerCtx) Config() *Configuration {
-	return ctx.config // Can be nil
-}
-
-// SendMessage attempts to send the given message to the client.
-// This may fail if the stream was closed or the stream context got canceled.
-//
-// This function should only be used by generated code.
-func (ctx *ServerCtx) SendMessage(out *Message) error {
-	// If Msg is set, marshal it to payload before sending.
-	if out.Msg != nil && len(out.GetPayload()) == 0 {
-		payload, err := proto.Marshal(out.Msg)
-		if err == nil {
-			out.SetPayload(payload)
-		}
-		// Return an error to the client if marshaling failed on the server side; don't close the stream.
-		out = messageWithError(nil, out, err)
-	}
-	select {
-	case ctx.c <- out.Message:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	return nil
 }

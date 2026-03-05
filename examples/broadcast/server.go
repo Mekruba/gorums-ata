@@ -130,7 +130,7 @@ func (b *BroadcastServer) Broadcast(ctx gorums.ServerCtx, msg *pb.BroadcastMsg) 
 	// Forward to all other nodes
 	config := ctx.Config()
 	if config != nil {
-		for _, node := range *config {
+		for _, node := range config {
 			if node.ID() == b.id {
 				continue
 			}
@@ -171,7 +171,7 @@ func (b *BroadcastServer) BroadcastQC(ctx gorums.ServerCtx, msg *pb.BroadcastMsg
 	var forwardedCount uint32
 	config := ctx.Config()
 	if config != nil {
-		for _, node := range *config {
+		for _, node := range config {
 			if node.ID() == b.id {
 				continue
 			}

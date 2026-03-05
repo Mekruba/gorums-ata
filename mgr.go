@@ -101,7 +101,7 @@ func (m *Manager) addNode(node *Node) {
 	m.nodes = append(m.nodes, node)
 }
 
-func (m *Manager) newNode(addr string, id uint32) (*Node, error) {
+func (m *Manager) newNode(id uint32, addr string) (*Node, error) {
 	if _, found := m.Node(id); found {
 		return nil, fmt.Errorf("node %d already exists", id)
 	}
@@ -112,6 +112,7 @@ func (m *Manager) newNode(addr string, id uint32) (*Node, error) {
 		Metadata:       m.opts.metadata,
 		PerNodeMD:      m.opts.perNodeMD,
 		DialOpts:       m.opts.grpcDialOpts,
+		RequestHandler: m.opts.requestHandlerFor(id),
 		Manager:        m,
 	}
 	n, err := newNode(addr, opts)
@@ -123,6 +124,8 @@ func (m *Manager) newNode(addr string, id uint32) (*Node, error) {
 }
 
 // getMsgID returns a unique message ID for a new RPC from this client's manager.
+// Client-initiated IDs never have the high bit set in practice: reaching 2^63
+// requires approximately 292,000 years at one million calls per second.
 func (m *Manager) getMsgID() uint64 {
 	return atomic.AddUint64(&m.nextMsgID, 1)
 }
