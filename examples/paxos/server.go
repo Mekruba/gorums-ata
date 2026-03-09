@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -27,46 +26,79 @@ func runServer(id uint32) {
 		}
 	}
 
-	// Create manager to connect to other nodes (for proposing)
+	// Build node address list for symmetric communication
+	var nodeAddrs []string
+	for _, node := range nodes {
+		nodeAddrs = append(nodeAddrs, node.addr)
+	}
+
+	// Create System with dynamic peer tracking (symmetric communication)
+	sys, err := gorums.NewSystem(addr,
+		gorums.WithConfig(id, gorums.WithNodeList(nodeAddrs)),
+		gorums.WithGRPCServerOptions(
+			grpc.Creds(insecure.NewCredentials()),
+		),
+	)
+	if err != nil {
+		log.Fatalf("Failed to create system: %v", err)
+	}
+
+	// Create Paxos server without static config
+	paxosSrv := NewPaxosServer(id)
+
+	// Create manager for proposer role
 	mgr := pb.NewManager(
 		gorums.WithDialOptions(
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		),
 	)
 
-	// Build map of all nodes (for proposer role)
+	// Register service with System (before starting to serve)
+	sys.RegisterService(mgr, func(srv *gorums.Server) {
+		pb.RegisterPaxosServer(srv, paxosSrv)
+	})
+
+	// Start server in background so it's listening for connections
+	go func() {
+		if err := sys.Serve(); err != nil {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+
+	// Give server time to start listening
+	time.Sleep(200 * time.Millisecond)
+
+	// Build map of all nodes
 	nodeMap := make(map[uint32]nodeAddr)
 	for _, node := range nodes {
 		nodeMap[node.id] = nodeAddr{addr: node.addr}
 	}
 
-	// Create configuration with all nodes
-	var config gorums.Configuration
-	var err error
-	if len(nodeMap) > 0 {
-		config, err = gorums.NewConfiguration(mgr, gorums.WithNodes(nodeMap))
-		if err != nil {
-			log.Fatalf("Failed to create configuration: %v", err)
-		}
-	}
-
-	// Create Paxos server (acceptor + learner)
-	paxosSrv := NewPaxosServer(id, config)
-
-	// Create Gorums server with configuration
-	srv := gorums.NewServer(gorums.WithConfiguration(&config))
-
-	// Register service
-	pb.RegisterPaxosServer(srv, paxosSrv)
-
-	// Start listening
-	lis, err := net.Listen("tcp", addr)
+	// Use System.NewOutboundConfig to establish bidirectional channels
+	// This automatically includes NodeID metadata for symmetric communication
+	proposerConfig, err := sys.NewOutboundConfig(
+		gorums.WithNodes(nodeMap),
+		gorums.WithDialOptions(
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		),
+	)
 	if err != nil {
-		log.Fatalf("Failed to listen on %s: %v", addr, err)
+		log.Fatalf("Failed to create proposer config: %v", err)
 	}
 
-	log.Printf("Node %d starting on %s", id, addr)
-	log.Printf("Quorum size: %d nodes", config.Size()/2+1)
+	// Set proposer config for client-initiated calls
+	paxosSrv.setProposerConfig(proposerConfig)
+
+	// Wait for bidirectional connections to establish
+	time.Sleep(500 * time.Millisecond)
+
+	if cfg := sys.Config(); cfg != nil {
+		log.Printf("Node %d starting on %s", id, addr)
+		log.Printf("Connected to %d peers (including self) via symmetric channels", cfg.Size())
+		log.Printf("Quorum size: %d nodes", cfg.Size()/2+1)
+	} else {
+		log.Printf("Node %d starting on %s", id, addr)
+	}
 
 	// Handle shutdown
 	go func() {
@@ -74,15 +106,12 @@ func runServer(id uint32) {
 		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 		<-signals
 		log.Println("Shutting down...")
-		srv.Stop()
-		mgr.Close()
+		sys.Stop() // System handles both server and manager cleanup
 		os.Exit(0)
 	}()
 
-	// Start serving
-	if err := srv.Serve(lis); err != nil {
-		log.Fatalf("Server error: %v", err)
-	}
+	// Keep running (server is already serving in goroutine)
+	select {}
 }
 
 // nodeAddr implements NodeAddress interface
@@ -108,19 +137,24 @@ type instanceState struct {
 
 // PaxosServer implements a Multi-Paxos acceptor and learner.
 type PaxosServer struct {
-	id     uint32
-	config gorums.Configuration
+	id             uint32
+	proposerConfig pb.Configuration // For client-initiated proposals
+	// Server uses dynamic config via ctx.Config() for server-initiated calls
 
 	mu        sync.RWMutex
 	instances map[uint32]*instanceState // Per-instance state
 }
 
-func NewPaxosServer(id uint32, config gorums.Configuration) *PaxosServer {
+func NewPaxosServer(id uint32) *PaxosServer {
 	return &PaxosServer{
 		id:        id,
-		config:    config,
 		instances: make(map[uint32]*instanceState),
 	}
+}
+
+// setProposerConfig sets the configuration for client-initiated proposals.
+func (p *PaxosServer) setProposerConfig(cfg pb.Configuration) {
+	p.proposerConfig = cfg
 }
 
 // getInstance returns the state for the given instance, creating it if needed.
@@ -243,10 +277,13 @@ func (p *PaxosServer) Learn(ctx gorums.ServerCtx, req *pb.LearnRequest) (*pb.Lea
 		fmt.Printf("\n🎉 Node %d: LEARNED value '%s' (inst=%d, proposal=%d from proposer %d)\n\n",
 			p.id, value, instance, proposalNum, proposerID)
 
-		// Broadcast to other nodes using ServerCtx.Config()
+		// Broadcast to other nodes using proposerConfig
 		// This demonstrates server-to-server communication in Multi-Paxos
-		if cfg := ctx.Config(); cfg != nil && cfg.Size() > 1 {
-			go p.broadcastLearn(cfg, req)
+		// We use proposerConfig (all nodes) instead of ctx.Config() (connected peers)
+		// because ctx.Config() only knows about peers that have connected TO this node
+		if p.proposerConfig != nil {
+			fmt.Printf("Node %d: Broadcasting to other nodes (config size: %d)\n", p.id, p.proposerConfig.Size())
+			go p.broadcastLearn(p.proposerConfig, req)
 		}
 
 		return pb.LearnResponse_builder{
@@ -265,24 +302,49 @@ func (p *PaxosServer) Learn(ctx gorums.ServerCtx, req *pb.LearnRequest) (*pb.Lea
 	}.Build(), nil
 }
 
-// broadcastLearn broadcasts learned value to other nodes.
+// broadcastLearn broadcasts learned value to other nodes (excluding self).
 func (p *PaxosServer) broadcastLearn(cfg gorums.Configuration, req *pb.LearnRequest) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
+	fmt.Printf("Node %d: broadcastLearn called with config size %d\n", p.id, len(cfg))
+
+	// Use the full configuration (including self) and filter responses afterward
 	cfgCtx := cfg.Context(ctx)
 	learned := pb.Learn(cfgCtx, req)
 
+	// Check if there's an error getting responses
+	numResponses := 0
+	newlyLearned := 0
+	alreadyLearned := 0
+	errorCount := 0
+
 	for learn := range learned.Seq() {
-		if learn.Err != nil {
-			// Silently ignore errors in broadcast
+		numResponses++
+
+		// Skip responses from ourselves
+		if learn.NodeID == p.id {
 			continue
 		}
+
+		if learn.Err != nil {
+			errorCount++
+			fmt.Printf("Node %d: ✗ Broadcast error to node %d: %v\n", p.id, learn.NodeID, learn.Err)
+			continue
+		}
+
 		if learn.Value.GetLearned() {
-			fmt.Printf("Node %d: Broadcast learned to node %d (inst=%d)\n",
+			newlyLearned++
+			fmt.Printf("Node %d: ✓ Node %d newly learned value (inst=%d)\n",
+				p.id, learn.NodeID, req.GetInstance())
+		} else {
+			alreadyLearned++
+			fmt.Printf("Node %d: ✓ Node %d already knew value (inst=%d)\n",
 				p.id, learn.NodeID, req.GetInstance())
 		}
 	}
+	fmt.Printf("Node %d: Broadcast complete - %d newly learned, %d already knew, %d errors\n",
+		p.id, newlyLearned, alreadyLearned, errorCount)
 }
 
 // GetLearnedValue returns the learned value for a specific instance (for testing/querying).
