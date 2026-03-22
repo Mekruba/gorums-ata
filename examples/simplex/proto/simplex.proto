@@ -1,0 +1,105 @@
+edition = "2023";
+
+package simplex;
+
+option go_package = "github.com/relab/gorums/examples/simplex/proto";
+option features.field_presence = IMPLICIT;
+
+import "google/protobuf/empty.proto";
+import "gorums.proto";
+
+// SimplexNode implements the Simplex Byzantine fault-tolerant consensus protocol.
+// See https://simplex.blog/protocol/ for the protocol description.
+//
+// The protocol proceeds in iterations h = 1, 2, 3, ..., where each iteration
+// has a designated leader who proposes a new block.  Nodes vote for the
+// leader's block (or for a dummy block on timeout), and a block is
+// "notarized" once it accumulates ≥⌈2n/3⌉ votes.  Once a node sees a
+// notarized block at height h it advances to iteration h+1 and sends a
+// Finalize message.  When ≥⌈2n/3⌉ Finalize messages are seen for height h
+// the transactions in that block are permanently confirmed.
+service SimplexNode {
+  // Propose is multicast by the current leader to propose a new block
+  // that extends its view of the notarized blockchain.
+  rpc Propose(ProposeMsg) returns (google.protobuf.Empty) {
+    option (gorums.multicast) = true;
+  }
+
+  // Vote is multicast by every node to cast a vote for a block (or for the
+  // dummy block when the 3Δ backup timer fires).
+  rpc Vote(VoteMsg) returns (google.protobuf.Empty) {
+    option (gorums.multicast) = true;
+  }
+
+  // Finalize is multicast by a node when it advances to the next iteration,
+  // signalling that it has seen a notarized block at the current height.
+  rpc Finalize(FinalizeMsg) returns (google.protobuf.Empty) {
+    option (gorums.multicast) = true;
+  }
+
+  // NotarizedChain is multicast together with Finalize so that lagging nodes
+  // can fast-forward to the latest notarized blockchain.
+  rpc NotarizedChain(NotarizedChainMsg) returns (google.protobuf.Empty) {
+    option (gorums.multicast) = true;
+  }
+}
+
+// Block is a consensus block.
+// A dummy block of height h has empty ParentHash and empty Txs.
+// The implicit genesis block has height 0 with empty ParentHash and empty Txs.
+message Block {
+  // Height is the iteration number this block belongs to.
+  uint64 Height = 1;
+  // ParentHash is the SHA-256 hash of the notarized parent chain
+  // (all notarized blocks at heights 1 … h-1); empty for genesis and dummy blocks.
+  string ParentHash = 2;
+  // Txs is the ordered list of transactions in this block.
+  repeated string Txs = 3;
+}
+
+// VoteMsg is multicast by a node to vote for a block at a given height.
+// A vote for a block whose ParentHash is empty (and Height > 0) is a
+// "timeout vote" for the dummy block.
+message VoteMsg {
+  // Height is the iteration being voted on.
+  uint64 Height = 1;
+  // Block is the block being voted for.
+  Block Block = 2;
+  // VoterId is the 1-indexed ID of the voting node.
+  uint32 VoterId = 3;
+}
+
+// Notarization bundles a block with the ≥⌈2n/3⌉ votes that certify it.
+message Notarization {
+  // Block is the notarized block (may be a dummy block).
+  Block Block = 1;
+  // Votes contains at least ⌈2n/3⌉ VoteMsgs for this block.
+  repeated VoteMsg Votes = 2;
+}
+
+// ProposeMsg is multicast by the leader of iteration h to propose a new block.
+message ProposeMsg {
+  // Height is the height of the proposed block.
+  uint64 Height = 1;
+  // Block is the new block at this height.
+  Block Block = 2;
+  // Chain is the notarized parent blockchain of length height-1.
+  repeated Notarization Chain = 3;
+  // LeaderId is the 1-indexed ID of the proposing leader.
+  uint32 LeaderId = 4;
+}
+
+// FinalizeMsg signals that a node has advanced past the given height.
+message FinalizeMsg {
+  // Height is the height that was just notarized.
+  uint64 Height = 1;
+  // NodeId is the 1-indexed ID of the node sending this message.
+  uint32 NodeId = 2;
+}
+
+// NotarizedChainMsg carries the full notarized blockchain so that lagging
+// nodes can catch up in a single message.
+message NotarizedChainMsg {
+  // Chain is the complete notarized blockchain up to the sender's current height.
+  repeated Notarization Chain = 1;
+}
