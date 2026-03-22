@@ -2,7 +2,10 @@ package stream
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/relab/gorums/internal/testutils/mock"
 )
@@ -43,6 +46,24 @@ func TestRouterRouteUnknown(t *testing.T) {
 	if r.RouteResponse(999, response{NodeID: 1}) {
 		t.Error("RouteResponse should return false for unknown msgID")
 	}
+}
+
+// TestRouterRouteResponseServerInitiated verifies that RouteResponse absorbs
+// unmatched server-initiated IDs and rejects unmatched client-initiated IDs.
+func TestRouterRouteResponseServerInitiated(t *testing.T) {
+	t.Run("ServerInitiatedReturnsTrue", func(t *testing.T) {
+		r := NewMessageRouter()
+		if !r.RouteResponse(ServerSequenceNumber(1), response{NodeID: 1}) {
+			t.Error("RouteResponse should return true for server-initiated msgID")
+		}
+	})
+
+	t.Run("ClientInitiatedUnknownReturnsFalse", func(t *testing.T) {
+		r := NewMessageRouter()
+		if r.RouteResponse(1, response{NodeID: 1}) {
+			t.Error("RouteResponse should return false for unmatched client-initiated msgID")
+		}
+	})
 }
 
 func TestRouterStreamingKeepsEntry(t *testing.T) {
@@ -145,39 +166,260 @@ func TestRouterRequeuePending(t *testing.T) {
 	}
 }
 
-type mockRequestHandler struct {
-	called bool
-}
-
-func (m *mockRequestHandler) HandleRequest(_ context.Context, _ *Message, release func(), _ func(*Message)) {
-	m.called = true
-	release()
-}
-
-func TestRouterRequestHandler(t *testing.T) {
-	t.Run("NoHandler", func(t *testing.T) {
+// TestRouterRouteInboundMessage verifies RouteInboundMessage demultiplexes
+// inbound server-side messages: server-initiated IDs (high bit set) are routed
+// to the pending map; client-initiated IDs (low bit) are dispatched to the handler.
+// release is always called regardless of message type.
+func TestRouterRouteInboundMessage(t *testing.T) {
+	t.Run("ClientInitiatedNilHandlerCallsRelease", func(t *testing.T) {
 		r := NewMessageRouter()
-		if _, ok := r.RequestHandler(); ok {
-			t.Error("RequestHandler should return false when no handler is set")
+		msg := Message_builder{MessageSeqNo: 1}.Build() // low-bit ID
+		released := make(chan struct{}, 1)
+		r.RouteInboundMessage(t.Context(), 1, msg, func() { released <- struct{}{} }, func(*Message) {})
+		select {
+		case <-released:
+		default:
+			t.Error("release should be called when no handler is registered for client-initiated ID")
 		}
 	})
 
-	t.Run("WithHandler", func(t *testing.T) {
-		mockHandler := &mockRequestHandler{}
-		r := NewMessageRouter(mockHandler)
+	t.Run("ClientInitiatedDispatchesToHandler", func(t *testing.T) {
+		h := newMockRequestHandler()
+		r := NewMessageRouter(h)
+		msg := Message_builder{MessageSeqNo: 1}.Build()
+		r.RouteInboundMessage(t.Context(), 1, msg, func() {}, func(*Message) {})
+		select {
+		case <-h.done:
+		case <-time.After(time.Second):
+			t.Fatal("handler should have been called for client-initiated request")
+		}
+	})
 
-		h, ok := r.RequestHandler()
-		if !ok {
-			t.Fatal("RequestHandler should return true for registered handler")
+	t.Run("ServerInitiatedPendingDelivered", func(t *testing.T) {
+		r := NewMessageRouter()
+		replyChan := make(chan response, 1)
+		msgID := ServerSequenceNumber(5)
+		r.Register(msgID, Request{
+			Ctx:          context.Background(),
+			Msg:          &Message{},
+			ResponseChan: replyChan,
+		})
+		msg := Message_builder{MessageSeqNo: msgID}.Build()
+		released := make(chan struct{}, 1)
+		r.RouteInboundMessage(t.Context(), 42, msg, func() { released <- struct{}{} }, func(*Message) {})
+		select {
+		case got := <-replyChan:
+			if got.NodeID != 42 {
+				t.Errorf("NodeID = %d, want 42", got.NodeID)
+			}
+		default:
+			t.Fatal("expected response on channel")
 		}
-		if h == nil {
-			t.Fatal("RequestHandler returned nil handler")
+		select {
+		case <-released:
+		default:
+			t.Fatal("release should be called after server-initiated response delivery")
 		}
+		// Entry consumed — routing again should still call release (silently absorbed).
+		released2 := make(chan struct{}, 1)
+		r.RouteInboundMessage(t.Context(), 42, msg, func() { released2 <- struct{}{} }, func(*Message) {})
+		select {
+		case <-released2:
+		default:
+			t.Error("release should be called for stale server-initiated ID")
+		}
+	})
 
-		// Verify the handler is callable.
-		h.HandleRequest(context.Background(), &Message{}, func() {}, func(*Message) {})
-		if !mockHandler.called {
-			t.Error("handler was not called")
+	t.Run("ServerInitiatedStaleAbsorbed", func(t *testing.T) {
+		r := NewMessageRouter()
+		msgID := ServerSequenceNumber(7)
+		msg := Message_builder{MessageSeqNo: msgID}.Build()
+		released := make(chan struct{}, 1)
+		// No pending entry — release should still be called (silently absorbed).
+		r.RouteInboundMessage(t.Context(), 1, msg, func() { released <- struct{}{} }, func(*Message) {})
+		select {
+		case <-released:
+		default:
+			t.Error("release should be called for unmatched server-initiated ID")
 		}
+	})
+}
+
+type mockRequestHandler struct {
+	called atomic.Bool
+	done   chan struct{}
+}
+
+func newMockRequestHandler() *mockRequestHandler {
+	return &mockRequestHandler{done: make(chan struct{})}
+}
+
+func (m *mockRequestHandler) HandleRequest(_ context.Context, _ *Message, release func(), _ func(*Message)) {
+	m.called.Store(true)
+	release()
+	if m.done != nil {
+		close(m.done)
+	}
+}
+
+func TestRouterRouteResponseDoesNotBlockOnCanceledRequest(t *testing.T) {
+	r := NewMessageRouter()
+	ctx, cancel := context.WithCancel(context.Background())
+	replyChan := make(chan response, 1)
+	replyChan <- response{NodeID: 99} // fill the channel
+	r.Register(42, Request{
+		Ctx:          ctx,
+		Msg:          &Message{},
+		ResponseChan: replyChan,
+	})
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		if !r.RouteResponse(42, response{NodeID: 1}) {
+			t.Error("RouteResponse should return true for registered msgID")
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("RouteResponse blocked on a canceled request with a full reply channel")
+	}
+}
+
+func TestRouterRouteResponsePrefersDeliveryWhenCanceledAndReplyChanReady(t *testing.T) {
+	r := NewMessageRouter()
+	ctx, cancel := context.WithCancel(context.Background())
+	replyChan := make(chan response, 1)
+	r.Register(42, Request{
+		Ctx:          ctx,
+		Msg:          &Message{},
+		ResponseChan: replyChan,
+	})
+	cancel()
+
+	if !r.RouteResponse(42, response{NodeID: 1, Err: ErrStreamDown}) {
+		t.Fatal("RouteResponse should return true for registered msgID")
+	}
+
+	select {
+	case got := <-replyChan:
+		if got.NodeID != 1 {
+			t.Fatalf("NodeID = %d, want 1", got.NodeID)
+		}
+		if !errors.Is(got.Err, ErrStreamDown) {
+			t.Fatalf("reply error = %v, want ErrStreamDown", got.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RouteResponse dropped a ready delivery on canceled context")
+	}
+}
+
+func TestReplyErrorDoesNotBlockOnCanceledRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	replyChan := make(chan response, 1)
+	replyChan <- response{NodeID: 99} // fill the channel
+	req := Request{
+		Ctx:          ctx,
+		ResponseChan: replyChan,
+	}
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		req.replyError(7, ErrStreamDown)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("replyError blocked on a canceled request with a full reply channel")
+	}
+}
+
+func TestReplyErrorPrefersDeliveryWhenCanceledAndReplyChanReady(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	replyChan := make(chan response, 1)
+	req := Request{
+		Ctx:          ctx,
+		ResponseChan: replyChan,
+	}
+	cancel()
+
+	req.replyError(7, ErrStreamDown)
+
+	select {
+	case got := <-replyChan:
+		if !errors.Is(got.Err, ErrStreamDown) {
+			t.Fatalf("reply error = %v, want ErrStreamDown", got.Err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replyError dropped a ready delivery on canceled context")
+	}
+}
+
+// TestRouterRouteMessage verifies the three dispatch branches of RouteMessage.
+func TestRouterRouteMessage(t *testing.T) {
+	const nodeID = uint32(1)
+	connCtx := context.Background()
+
+	t.Run("RoutesToPendingCall", func(t *testing.T) {
+		r := NewMessageRouter()
+		replyChan := make(chan response, 1)
+		r.Register(42, Request{
+			Ctx:          connCtx,
+			Msg:          &Message{},
+			ResponseChan: replyChan,
+		})
+
+		msg := Message_builder{MessageSeqNo: 42, Method: mock.TestMethod}.Build()
+		r.RouteMessage(connCtx, nodeID, msg, nil)
+		select {
+		case got := <-replyChan:
+			if got.NodeID != nodeID {
+				t.Errorf("NodeID = %d, want %d", got.NodeID, nodeID)
+			}
+		default:
+			t.Fatal("expected response on channel")
+		}
+	})
+
+	t.Run("ServerInitiatedDispatchesHandler", func(t *testing.T) {
+		handler := newMockRequestHandler()
+		r := NewMessageRouter(handler)
+
+		enqueueCalled := false
+		enqueue := func(Request) { enqueueCalled = true }
+
+		msg := Message_builder{MessageSeqNo: ServerSequenceNumber(1), Method: mock.TestMethod}.Build()
+		r.RouteMessage(connCtx, nodeID, msg, enqueue)
+		// Wait for the handler goroutine to complete before reading handler.called.
+		select {
+		case <-handler.done:
+		case <-time.After(time.Second):
+			t.Fatal("handler was not called within timeout")
+		}
+		if !handler.called.Load() {
+			t.Error("handler was not called for server-initiated message")
+		}
+		// enqueue should not be triggered by the dispatch itself (only by send closure).
+		if enqueueCalled {
+			t.Error("enqueue should not be called during request dispatch")
+		}
+	})
+
+	t.Run("ServerInitiatedNoHandlerIsSilentlyDropped", func(_ *testing.T) {
+		r := NewMessageRouter()
+		msg := Message_builder{MessageSeqNo: ServerSequenceNumber(1), Method: mock.TestMethod}.Build()
+		r.RouteMessage(connCtx, nodeID, msg, nil) // must not panic
+	})
+
+	t.Run("ClientInitiatedUnknownIsSilentlyDropped", func(_ *testing.T) {
+		r := NewMessageRouter()
+		msg := Message_builder{MessageSeqNo: 999, Method: mock.TestMethod}.Build()
+		r.RouteMessage(connCtx, nodeID, msg, nil) // must not panic
 	})
 }

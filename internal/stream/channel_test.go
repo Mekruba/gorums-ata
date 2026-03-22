@@ -706,6 +706,339 @@ func TestChannelConcurrentStreamReconnect(t *testing.T) {
 	}
 }
 
+type recvStartedStream struct {
+	*mockBidiStream
+	started chan struct{}
+	once    sync.Once
+}
+
+func newRecvStartedStream() *recvStartedStream {
+	return &recvStartedStream{
+		mockBidiStream: newMockBidiStream(),
+		started:        make(chan struct{}),
+	}
+}
+
+func (s *recvStartedStream) Recv() (*Message, error) {
+	s.once.Do(func() { close(s.started) })
+	return s.mockBidiStream.Recv()
+}
+
+// TestChannelStaleReceiverDoesNotRequeueCurrentPending verifies that a receiver
+// blocked on an old stream instance cannot requeue requests that were already
+// registered on a newer stream.
+func TestChannelStaleReceiverDoesNotRequeueCurrentPending(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stale := newRecvStartedStream()
+	current := newMockBidiStream()
+	c := NewInboundChannel(ctx, 1, 1, stale, NewMessageRouter())
+	t.Cleanup(func() {
+		_ = c.Close()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		c.receiver()
+		close(done)
+	}()
+
+	select {
+	case <-stale.started:
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("receiver did not start reading from stale stream")
+	}
+
+	c.streamMut.Lock()
+	c.stream = current
+	c.streamMut.Unlock()
+
+	const msgID = 42
+	msg := Message_builder{
+		MessageSeqNo: msgID,
+		Method:       mock.TestMethod,
+	}.Build()
+	c.router.Register(msgID, Request{
+		Ctx:          ctx,
+		Msg:          msg,
+		ResponseChan: make(chan response, 1),
+	})
+
+	stale.close()
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(c.sendQ) > 0 || !routerExists(c, msgID) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if got := len(c.sendQ); got != 0 {
+		t.Fatalf("stale receiver requeued current-stream request: sendQ len = %d, want 0", got)
+	}
+	if !routerExists(c, msgID) {
+		t.Fatal("stale receiver removed pending request for the current stream")
+	}
+
+	current.close()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("receiver did not exit after context cancellation")
+	}
+}
+
+// lateAfterFuncContext is a test context implementation that gives deterministic
+// control over when the AfterFunc callback fires. The trigger() method
+// simulates context cancellation and fires the registered callback.
+type lateAfterFuncContext struct {
+	ready chan struct{}
+	mu    sync.Mutex
+	err   error
+	f     func()
+	done  chan struct{}
+}
+
+func newLateAfterFuncContext() *lateAfterFuncContext {
+	return &lateAfterFuncContext{
+		ready: make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+}
+
+func (*lateAfterFuncContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *lateAfterFuncContext) Done() <-chan struct{} { return c.done }
+
+func (c *lateAfterFuncContext) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+func (*lateAfterFuncContext) Value(any) any { return nil }
+
+func (c *lateAfterFuncContext) AfterFunc(f func()) func() bool {
+	c.mu.Lock()
+	c.f = f
+	close(c.ready)
+	c.mu.Unlock()
+	return func() bool { return false }
+}
+
+func (c *lateAfterFuncContext) trigger() {
+	<-c.ready
+	c.mu.Lock()
+	c.err = context.Canceled
+	f := c.f
+	close(c.done)
+	c.mu.Unlock()
+	if f != nil {
+		go f()
+	}
+}
+
+// lateCancelStream is a test stream that records sent message IDs and
+// blocks Recv until closed. This lets tests control when the receiver
+// goroutine sees a stream error after sends have completed.
+type lateCancelStream struct {
+	recvStarted chan struct{}
+	recvOnce    sync.Once
+	closed      chan struct{}
+	sends       chan uint64
+}
+
+func newLateCancelStream() *lateCancelStream {
+	return &lateCancelStream{
+		recvStarted: make(chan struct{}),
+		closed:      make(chan struct{}),
+		sends:       make(chan uint64, 8),
+	}
+}
+
+func (s *lateCancelStream) Send(msg *Message) error {
+	s.sends <- msg.GetMessageSeqNo()
+	return nil
+}
+
+func (s *lateCancelStream) Recv() (*Message, error) {
+	s.recvOnce.Do(func() { close(s.recvStarted) })
+	<-s.closed
+	return nil, context.Canceled
+}
+
+func (s *lateCancelStream) close() {
+	close(s.closed)
+}
+
+// TestChannelLateCancelWatcherRequeuesPending verifies that a late-running
+// per-request cancel watcher cannot strand newer pending requests on a stream
+// it clears after the original Send already returned.
+func TestChannelLateCancelWatcherRequeuesPending(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	stream := newLateCancelStream()
+	c := NewInboundChannel(ctx, 1, 4, stream, NewMessageRouter())
+	t.Cleanup(func() {
+		_ = c.Close()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		c.receiver()
+		close(done)
+	}()
+
+	select {
+	case <-stream.recvStarted:
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("receiver did not start reading from stream")
+	}
+
+	ctx1 := newLateAfterFuncContext()
+	reply1 := make(chan response, 1)
+	c.Enqueue(Request{
+		Ctx:          ctx1,
+		Msg:          Message_builder{MessageSeqNo: 1, Method: mock.TestMethod}.Build(),
+		ResponseChan: reply1,
+	})
+	select {
+	case msgID := <-stream.sends:
+		if msgID != 1 {
+			t.Fatalf("first send msgID = %d, want 1", msgID)
+		}
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("first request was not sent")
+	}
+
+	reply2 := make(chan response, 1)
+	c.Enqueue(Request{
+		Ctx:          context.Background(),
+		Msg:          Message_builder{MessageSeqNo: 2, Method: mock.TestMethod}.Build(),
+		ResponseChan: reply2,
+	})
+	select {
+	case msgID := <-stream.sends:
+		if msgID != 2 {
+			t.Fatalf("second send msgID = %d, want 2", msgID)
+		}
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("second request was not sent")
+	}
+
+	if !routerExists(c, 2) {
+		t.Fatal("second request should be pending before late cancel watcher runs")
+	}
+
+	ctx1.trigger()
+	stream.close()
+
+	select {
+	case resp := <-reply2:
+		if !errors.Is(resp.Err, ErrStreamDown) {
+			t.Fatalf("reply2 error = %v, want ErrStreamDown", resp.Err)
+		}
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("late cancel watcher stranded newer pending request")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(defaultTestTimeout):
+		t.Fatal("receiver did not exit after context cancellation")
+	}
+}
+
+type signalingRequestHandler struct {
+	called chan *Message
+}
+
+func (h *signalingRequestHandler) HandleRequest(_ context.Context, msg *Message, release func(), _ func(*Message)) {
+	defer release()
+	select {
+	case h.called <- msg:
+	default:
+	}
+}
+
+// TestChannelReceiverDispatchesOnlyServerInitiatedUnknownMessages verifies that
+// the client-side receiver drops late client-call responses that no longer have
+// a pending router entry, while still dispatching unmatched server-initiated
+// requests to the registered back-channel handler.
+func TestChannelReceiverDispatchesOnlyServerInitiatedUnknownMessages(t *testing.T) {
+	tests := []struct {
+		name       string
+		msgID      uint64
+		wantHandle bool
+	}{
+		{
+			name:       "ClientInitiatedStaleResponseIsDropped",
+			msgID:      1,
+			wantHandle: false,
+		},
+		{
+			name:       "ServerInitiatedRequestIsDispatched",
+			msgID:      ServerSequenceNumber(1),
+			wantHandle: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			stream := newMockBidiStream()
+			handler := &signalingRequestHandler{called: make(chan *Message, 1)}
+			c := NewInboundChannel(ctx, 1, 1, stream, NewMessageRouter(handler))
+			t.Cleanup(func() {
+				_ = c.Close()
+			})
+
+			done := make(chan struct{})
+			go func() {
+				c.receiver()
+				close(done)
+			}()
+
+			stream.msgQ <- Message_builder{
+				MessageSeqNo: tt.msgID,
+				Method:       mock.TestMethod,
+			}.Build()
+
+			if tt.wantHandle {
+				select {
+				case got := <-handler.called:
+					if got.GetMessageSeqNo() != tt.msgID {
+						t.Fatalf("handler msgID = %d, want %d", got.GetMessageSeqNo(), tt.msgID)
+					}
+				case <-time.After(defaultTestTimeout):
+					t.Fatal("expected handler dispatch")
+				}
+			} else {
+				select {
+				case got := <-handler.called:
+					t.Fatalf("unexpected handler dispatch for stale response msgID %d", got.GetMessageSeqNo())
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+
+			stream.close()
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(defaultTestTimeout):
+				t.Fatal("receiver did not exit after context cancellation")
+			}
+		})
+	}
+}
+
 func TestChannelRouterLifecycle(t *testing.T) {
 	tc := setupChannel(t, echoServer)
 

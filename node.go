@@ -118,12 +118,14 @@ func newOutboundNode(addr string, opts nodeOptions) (*Node, error) {
 // newInboundNode creates a Node for a known peer or self without an active
 // channel. Used by inboundManager at construction time for all configured
 // peers; the channel is attached when the peer's stream arrives.
-func newInboundNode(id uint32, addr string, msgIDGen func() uint64) *Node {
+// The handler, if non-nil, is stored in the router and used to dispatch
+// client-initiated requests received on the inbound stream.
+func newInboundNode(id uint32, addr string, msgIDGen func() uint64, handler stream.RequestHandler) *Node {
 	return &Node{
 		id:       id,
 		addr:     addr,
 		msgIDGen: msgIDGen,
-		router:   stream.NewMessageRouter(),
+		router:   stream.NewMessageRouter(handler),
 	}
 }
 
@@ -156,30 +158,29 @@ func (n *Node) IsInbound() bool {
 // attachStream attaches a new inbound channel to the node when a peer connects.
 // If the node already has an active channel (e.g., a stale stream from a previous
 // connection), it is atomically replaced and the old channel is closed.
-func (n *Node) attachStream(streamCtx context.Context, inboundStream stream.BidiStream, sendBufferSize uint) {
+// The returned detach function closes and removes the channel, but only if it
+// is still the active one. This prevents stale cleanup from an older stream
+// from detaching a replacement channel that has already taken over.
+func (n *Node) attachStream(streamCtx context.Context, inboundStream stream.BidiStream, sendBufferSize uint) (detach func() bool) {
 	newCh := stream.NewInboundChannel(streamCtx, n.id, sendBufferSize, inboundStream, n.router)
 	if old := n.channel.Swap(newCh); old != nil {
 		old.Close()
 	}
-}
-
-// detachStream closes and removes the node's inbound channel when the peer disconnects.
-func (n *Node) detachStream() {
-	if ch := n.channel.Swap(nil); ch != nil {
-		ch.Close()
+	return func() bool {
+		if n.channel.CompareAndSwap(newCh, nil) {
+			newCh.Close()
+			return true
+		}
+		return false
 	}
 }
 
-// RouteResponse routes an incoming message as a response to a pending
-// server-initiated call. Returns true if the message matched a pending
-// call and was handled; false if it should be dispatched as a new request.
+// RouteInbound delivers a response to a pending call or dispatches a
+// client-initiated request to the registered handler. The release
+// function is always called.
 // This implements the [stream.PeerNode] interface.
-func (n *Node) RouteResponse(msg *stream.Message) bool {
-	return n.router.RouteResponse(msg.GetMessageSeqNo(), NodeResponse[*stream.Message]{
-		NodeID: n.id,
-		Value:  msg,
-		Err:    msg.ErrorStatus(),
-	})
+func (n *Node) RouteInbound(ctx context.Context, msg *stream.Message, release func(), send func(*stream.Message)) {
+	n.router.RouteInboundMessage(ctx, n.id, msg, release, send)
 }
 
 // Enqueue enqueues a request to this node's channel.

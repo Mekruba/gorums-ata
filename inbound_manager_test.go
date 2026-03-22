@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -289,30 +290,33 @@ func TestAcceptPeerUpdatesConfig(t *testing.T) {
 func TestAcceptPeer(t *testing.T) {
 	im := newTestInboundManager(t, 1)
 
+	typeNode := reflect.TypeFor[*Node]()
+	typeNilPeer := reflect.TypeFor[*nilPeerNode]()
+
 	tests := []struct {
 		name     string
 		ctx      context.Context
-		wantNode bool
+		wantType reflect.Type
 	}{
 		{
 			name:     "UntrackedClientNoMetadata",
 			ctx:      t.Context(), // no gorums-node-id metadata: regular client, not tracked in ClientConfig
-			wantNode: false,
+			wantType: typeNilPeer,
 		},
 		{
 			name:     "PeerClientAccepted",
 			ctx:      inboundCtx(t.Context(), 0), // gorums-node-id: 0 => back-channel to peer client
-			wantNode: true,
+			wantType: typeNode,
 		},
 		{
 			name:     "UnknownPeerID",
 			ctx:      inboundCtx(t.Context(), 99), // not in configured set
-			wantNode: false,
+			wantType: typeNilPeer,
 		},
 		{
 			name:     "KnownPeer",
 			ctx:      inboundCtx(t.Context(), 2),
-			wantNode: true,
+			wantType: typeNode,
 		},
 	}
 	for _, tc := range tests {
@@ -323,12 +327,10 @@ func TestAcceptPeer(t *testing.T) {
 			if err != nil {
 				t.Fatalf("AcceptPeer() unexpected error: %v", err)
 			}
-			if (node != nil) != tc.wantNode {
-				t.Errorf("AcceptPeer() node non-nil = %v; want %v", node != nil, tc.wantNode)
+			if got := reflect.TypeOf(node); got != tc.wantType {
+				t.Errorf("AcceptPeer() type = %v; want %v", got, tc.wantType)
 			}
-			if node != nil {
-				cleanup()
-			}
+			cleanup()
 		})
 	}
 }
@@ -355,6 +357,43 @@ func TestAcceptPeerReplacesExistingStream(t *testing.T) {
 	node := im.nodes[3]
 	if ch := node.channel.Load(); ch == nil {
 		t.Fatal("channel should not be nil after replacement")
+	}
+}
+
+// TestAcceptPeerStaleCleanupDoesNotDetachReplacement verifies that when a peer
+// reconnects, the cleanup function returned for the old stream cannot detach
+// the replacement channel.
+func TestAcceptPeerStaleCleanupDoesNotDetachReplacement(t *testing.T) {
+	im := newTestInboundManager(t, 1)
+
+	first := newMockBidiStream()
+	t.Cleanup(first.close)
+	_, cleanupFirst, err := im.AcceptPeer(inboundCtx(t.Context(), 2), first)
+	if err != nil {
+		t.Fatalf("AcceptPeer(first) error: %v", err)
+	}
+	checkIDs(t, im.Config(), []uint32{1, 2}, "after first connect")
+
+	second := newMockBidiStream()
+	t.Cleanup(second.close)
+	_, cleanupSecond, err := im.AcceptPeer(inboundCtx(t.Context(), 2), second)
+	if err != nil {
+		t.Fatalf("AcceptPeer(second) error: %v", err)
+	}
+	checkIDs(t, im.Config(), []uint32{1, 2}, "after replacement")
+
+	// Stale cleanup from the first connection must not detach the replacement.
+	cleanupFirst()
+	checkIDs(t, im.Config(), []uint32{1, 2}, "after stale cleanup")
+	if im.nodes[2].channel.Load() == nil {
+		t.Fatal("stale cleanup detached the replacement channel")
+	}
+
+	// Current cleanup should detach the active channel.
+	cleanupSecond()
+	checkIDs(t, im.Config(), []uint32{1}, "after current cleanup")
+	if im.nodes[2].channel.Load() != nil {
+		t.Fatal("current cleanup should detach the active channel")
 	}
 }
 
