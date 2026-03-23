@@ -9,6 +9,8 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"flag"
 	"fmt"
 	"log"
@@ -47,6 +49,28 @@ func main() {
 	}
 	fmt.Println()
 
+	// Generate one Ed25519 key pair per node.  In a real deployment each node
+	// would load its own key from secure storage and publish its public key
+	// out-of-band (e.g., via a configuration file or PKI).  Here we generate
+	// ephemeral keys for the demo and share all public keys with every node.
+	type keyPair struct {
+		pub  ed25519.PublicKey
+		priv ed25519.PrivateKey
+	}
+	keys := make([]keyPair, *n)
+	for i := range keys {
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			log.Fatalf("ed25519.GenerateKey: %v", err)
+		}
+		keys[i] = keyPair{pub, priv}
+	}
+	// Build the shared public-key map (1-indexed node IDs).
+	pubKeys := make(map[uint32]ed25519.PublicKey, *n)
+	for i, kp := range keys {
+		pubKeys[uint32(i+1)] = kp.pub
+	}
+
 	// Create n local Gorums systems.  NewLocalSystems assigns node IDs 1..n,
 	// allocates listeners on random ports, and sets up outbound configs.
 	dialOpts := gorums.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -62,7 +86,7 @@ func main() {
 		id := uint32(i + 1)
 		outCfg := sys.OutboundConfig()
 		onFinalize := makeOnFinalize(id)
-		node := NewNode(id, *n, outCfg, onFinalize)
+		node := NewNode(id, *n, outCfg, keys[i].priv, pubKeys, onFinalize)
 		nodes[i] = node
 		sys.RegisterService(nil, func(srv *gorums.Server) {
 			pb.RegisterSimplexNodeServer(srv, node)

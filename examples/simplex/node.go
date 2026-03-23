@@ -21,6 +21,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"fmt"
 	"log/slog"
@@ -43,6 +44,11 @@ type Node struct {
 	id  uint32               // 1-indexed node ID
 	n   int                  // total cluster size
 	cfg gorums.Configuration // outbound configuration for peer multicasts
+
+	// privKey is this node's Ed25519 signing key.
+	privKey ed25519.PrivateKey
+	// pubKeys maps 1-indexed node IDs to their Ed25519 public keys.
+	pubKeys map[uint32]ed25519.PublicKey
 
 	mu     sync.Mutex
 	ctx    context.Context
@@ -83,14 +89,17 @@ type Node struct {
 
 // NewNode creates and returns a Simplex consensus node.
 // id is the 1-indexed node ID, n is the cluster size, cfg is the outbound
-// Gorums configuration for sending multicasts, and onFinalize (optional) is
-// called whenever transactions are permanently confirmed.
-func NewNode(id uint32, n int, cfg gorums.Configuration, onFinalize func(uint64, []string)) *Node {
+// Gorums configuration for sending multicasts, privKey is this node's
+// Ed25519 signing key, pubKeys maps each node ID to its public key, and
+// onFinalize (optional) is called whenever transactions are permanently confirmed.
+func NewNode(id uint32, n int, cfg gorums.Configuration, privKey ed25519.PrivateKey, pubKeys map[uint32]ed25519.PublicKey, onFinalize func(uint64, []string)) *Node {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Node{
 		id:               id,
 		n:                n,
 		cfg:              cfg,
+		privKey:          privKey,
+		pubKeys:          pubKeys,
 		ctx:              ctx,
 		cancel:           cancel,
 		height:           1,
@@ -267,6 +276,7 @@ func (nd *Node) sendProposal(msg *pb.ProposeMsg) {
 	if msg == nil {
 		return
 	}
+	signPropose(msg, nd.privKey)
 	cfgCtx := nd.cfg.Context(nd.ctx)
 	if err := pb.Propose(cfgCtx, msg); err != nil && nd.ctx.Err() == nil {
 		slog.Warn("propose send error", "node", nd.id, "height", msg.GetHeight(), "err", err)
@@ -326,6 +336,7 @@ func (nd *Node) processPendingLocked(h uint64) {
 // doSendVote multicasts a vote for block at height h.
 func (nd *Node) doSendVote(h uint64, block *pb.Block) {
 	msg := pb.VoteMsg_builder{Height: h, Block: block, VoterId: nd.id}.Build()
+	signVote(msg, nd.privKey)
 	cfgCtx := nd.cfg.Context(nd.ctx)
 	if err := pb.Vote(cfgCtx, msg); err != nil && nd.ctx.Err() == nil {
 		slog.Warn("vote send error", "node", nd.id, "height", h, "err", err)
@@ -335,6 +346,7 @@ func (nd *Node) doSendVote(h uint64, block *pb.Block) {
 // doSendFinalize multicasts a Finalize message for height h.
 func (nd *Node) doSendFinalize(h uint64) {
 	msg := pb.FinalizeMsg_builder{Height: h, NodeId: nd.id}.Build()
+	signFinalize(msg, nd.privKey)
 	cfgCtx := nd.cfg.Context(nd.ctx)
 	if err := pb.Finalize(cfgCtx, msg); err != nil && nd.ctx.Err() == nil {
 		slog.Warn("finalize send error", "node", nd.id, "height", h, "err", err)
@@ -386,6 +398,19 @@ func (nd *Node) Propose(ctx gorums.ServerCtx, req *pb.ProposeMsg) {
 
 func (nd *Node) handlePropose(req *pb.ProposeMsg) {
 	h := req.GetHeight()
+
+	// Verify the proposal signature before touching any state.
+	// We check the claimed leader ID against leaderForHeight after we have nd.mu,
+	// but the public key lookup only needs the leader ID, which is part of the signed
+	// payload — so we verify first to reject forged LeaderId values.
+	leaderID := req.GetLeaderId()
+	if pub, ok := nd.pubKeys[leaderID]; !ok {
+		slog.Warn("propose from unknown node", "claimed_leader", leaderID)
+		return
+	} else if err := verifyPropose(req, pub); err != nil {
+		slog.Warn("propose signature invalid", "err", err)
+		return
+	}
 
 	nd.mu.Lock()
 	if h < nd.height {
@@ -443,6 +468,16 @@ func (nd *Node) Vote(ctx gorums.ServerCtx, req *pb.VoteMsg) {
 
 func (nd *Node) handleVote(req *pb.VoteMsg) {
 	h := req.GetHeight()
+
+	// Verify the vote signature before touching any state.
+	voterID := req.GetVoterId()
+	if pub, ok := nd.pubKeys[voterID]; !ok {
+		slog.Warn("vote from unknown node", "claimed_voter", voterID)
+		return
+	} else if err := verifyVote(req, pub); err != nil {
+		slog.Warn("vote signature invalid", "err", err)
+		return
+	}
 
 	nd.mu.Lock()
 	if h < nd.height {
@@ -502,6 +537,15 @@ func (nd *Node) handleFinalize(req *pb.FinalizeMsg) {
 	h := req.GetHeight()
 	nodeID := req.GetNodeId()
 
+	// Verify the finalize signature before touching any state.
+	if pub, ok := nd.pubKeys[nodeID]; !ok {
+		slog.Warn("finalize from unknown node", "claimed_node", nodeID)
+		return
+	} else if err := verifyFinalize(req, pub); err != nil {
+		slog.Warn("finalize signature invalid", "err", err)
+		return
+	}
+
 	nd.mu.Lock()
 	if nd.finalized[h] {
 		nd.mu.Unlock()
@@ -531,6 +575,24 @@ func (nd *Node) handleNotarizedChain(req *pb.NotarizedChainMsg) {
 	incomingLen := uint64(len(incoming))
 	if incomingLen == 0 {
 		return
+	}
+
+	// Verify every vote in every notarization in the incoming chain.
+	// This authenticates the chain transitively: the notarizations are only
+	// trusted if the votes that comprise them carry valid signatures.
+	for _, notarization := range incoming {
+		for _, vote := range notarization.GetVotes() {
+			voterID := vote.GetVoterId()
+			pub, ok := nd.pubKeys[voterID]
+			if !ok {
+				slog.Warn("notarized chain contains vote from unknown node", "claimed_voter", voterID)
+				return
+			}
+			if err := verifyVote(vote, pub); err != nil {
+				slog.Warn("notarized chain contains invalid vote signature", "err", err)
+				return
+			}
+		}
 	}
 
 	nd.mu.Lock()

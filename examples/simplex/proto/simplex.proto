@@ -67,6 +67,9 @@ message VoteMsg {
   Block Block = 2;
   // VoterId is the 1-indexed ID of the voting node.
   uint32 VoterId = 3;
+  // Signature is the Ed25519 signature over the canonical vote bytes
+  // (domain || height || blockID), produced by the VoterId's private key.
+  bytes Signature = 4;
 }
 
 // Notarization bundles a block with the ≥⌈2n/3⌉ votes that certify it.
@@ -87,6 +90,9 @@ message ProposeMsg {
   repeated Notarization Chain = 3;
   // LeaderId is the 1-indexed ID of the proposing leader.
   uint32 LeaderId = 4;
+  // Signature is the Ed25519 signature over the canonical propose bytes
+  // (domain || height || blockID || chainHash), produced by the leader's private key.
+  bytes Signature = 5;
 }
 
 // FinalizeMsg signals that a node has advanced past the given height.
@@ -95,6 +101,9 @@ message FinalizeMsg {
   uint64 Height = 1;
   // NodeId is the 1-indexed ID of the node sending this message.
   uint32 NodeId = 2;
+  // Signature is the Ed25519 signature over the canonical finalize bytes
+  // (domain || height), produced by the NodeId's private key.
+  bytes Signature = 3;
 }
 
 // NotarizedChainMsg carries the full notarized blockchain so that lagging
