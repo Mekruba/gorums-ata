@@ -40,8 +40,9 @@ func TestContext(t testing.TB, timeout time.Duration) context.Context {
 	return ctx
 }
 
-// InsecureDialOptions returns the default insecure gRPC dial options for testing.
-func InsecureDialOptions(_ testing.TB) ManagerOption {
+// InsecureDialOptions returns a DialOption with insecure transport credentials
+// for testing.
+func InsecureDialOptions(_ testing.TB) DialOption {
 	return WithDialOptions(
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
@@ -69,14 +70,6 @@ func TestQuorumCallError(_ testing.TB, nodeErrors map[uint32]error) QuorumCallEr
 		errs = append(errs, nodeError{cause: err, nodeID: nodeID})
 	}
 	return QuorumCallError{cause: ErrIncomplete, errors: errs}
-}
-
-// TestManager creates a new Manager with real network dial support and any additional
-// ManagerOptions (e.g., WithMetadata). The manager is automatically closed via t.Cleanup.
-func TestManager(t testing.TB, opts ...ManagerOption) *Manager {
-	t.Helper()
-	to := &testOptions{managerOpts: opts}
-	return to.getOrCreateManager(t)
 }
 
 // TestConfiguration creates servers and a configuration for testing.
@@ -120,11 +113,13 @@ func TestConfiguration(t testing.TB, numServers int, srvFn func(i int) ServerIfa
 		testOpts.preConnectHook(stopAllFn)
 	}
 
-	mgr := testOpts.getOrCreateManager(t)
-	cfg, err := NewConfiguration(mgr, testOpts.nodeListOption(addrs))
+	// Create configuration and register its cleanup LAST so it runs FIRST (LIFO)
+	dialOptions := append([]DialOption{TestDialOptions(t)}, testOpts.managerOpts...)
+	cfg, err := NewConfig(testOpts.nodeListOption(addrs), dialOptions...)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(Closer(t, cfg))
 	return cfg
 }
 
@@ -157,8 +152,8 @@ func TestNode(t testing.TB, srvFn func(i int) ServerIface, opts ...TestOption) *
 // Example usage:
 //
 //	addrs := gorums.TestServers(t, 3, serverFn)
-//	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-//	t.Cleanup(gorums.Closer(t, mgr))
+//	cfg, err := gorums.NewConfig(gorums.WithNodeList(addrs), gorums.TestDialOptions(t))
+//	t.Cleanup(gorums.Closer(t, cfg))
 //	...
 //
 // This function can be used by other packages for testing purposes, as long as
@@ -369,9 +364,7 @@ func StreamServerFn(_ int) ServerIface {
 		for i := 1; i <= 3; i++ {
 			resp := pb.String(fmt.Sprintf("echo: %s-%d", val, i))
 			out := NewResponseMessage(in, resp)
-			if err := ctx.SendMessage(out); err != nil {
-				return nil, err
-			}
+			ctx.SendMessage(out)
 			time.Sleep(10 * time.Millisecond)
 		}
 		return nil, nil
@@ -389,9 +382,7 @@ func StreamBenchmarkServerFn(_ int) ServerIface {
 		for i := 1; i <= 3; i++ {
 			resp := pb.String(fmt.Sprintf("echo: %s-%d", val, i))
 			out := NewResponseMessage(in, resp)
-			if err := ctx.SendMessage(out); err != nil {
-				return nil, err
-			}
+			ctx.SendMessage(out)
 		}
 		return nil, nil
 	})

@@ -24,9 +24,9 @@ func TestServerCallback(t *testing.T) {
 		message = m.Get("message")[0]
 		signal <- struct{}{}
 	})
-	mgrOption := gorums.WithMetadata(metadata.New(map[string]string{"message": "hello"}))
+	dialOption := gorums.WithMetadata(metadata.New(map[string]string{"message": "hello"}))
 
-	gorums.TestNode(t, nil, srvOption, mgrOption)
+	gorums.TestNode(t, nil, srvOption, dialOption)
 
 	select {
 	case <-time.After(100 * time.Millisecond):
@@ -122,13 +122,11 @@ func TestTCPReconnection(t *testing.T) {
 		_ = srv.Serve(lis)
 	}()
 
-	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-	t.Cleanup(gorums.Closer(t, mgr))
-
-	cfg, err := gorums.NewConfiguration(mgr, gorums.WithNodeList([]string{addr}))
+	cfg, err := gorums.NewConfig(gorums.WithNodeList([]string{addr}), gorums.InsecureDialOptions(t))
 	if err != nil {
-		t.Fatalf("NewConfiguration failed: %v", err)
+		t.Fatalf("NewConfig failed: %v", err)
 	}
+	t.Cleanup(gorums.Closer(t, cfg))
 	node := cfg.Nodes()[0]
 
 	// Send first message

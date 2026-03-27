@@ -48,7 +48,7 @@ type Node struct {
 	// Only assigned at creation.
 	id   uint32
 	addr string
-	mgr  *Manager // only used for backward compatibility to allow Configuration.Manager()
+	mgr  *outboundManager // owning manager for this node
 
 	msgIDGen func() uint64
 	router   *stream.MessageRouter
@@ -64,7 +64,7 @@ type Node struct {
 //	resp, err := service.GRPCCall(nodeCtx, req)
 func (n *Node) Context(parent context.Context) *NodeContext {
 	if n == nil {
-		panic("gorums: Context called with nil node")
+		panic("gorums: Context called on nil node")
 	}
 	return &NodeContext{Context: parent, node: n}
 }
@@ -75,10 +75,9 @@ type nodeOptions struct {
 	SendBufferSize uint
 	MsgIDGen       func() uint64
 	Metadata       metadata.MD
-	PerNodeMD      func(uint32) metadata.MD
 	DialOpts       []grpc.DialOption
 	RequestHandler stream.RequestHandler
-	Manager        *Manager // only used for backward compatibility to allow Configuration.Manager()
+	Manager        *outboundManager // owning manager
 }
 
 // newOutboundNode creates a new node using the provided options. It establishes
@@ -105,9 +104,6 @@ func newOutboundNode(addr string, opts nodeOptions) (*Node, error) {
 
 	// Create outgoing context with metadata for this node's stream.
 	md := opts.Metadata.Copy()
-	if opts.PerNodeMD != nil {
-		md = metadata.Join(md, opts.PerNodeMD(n.id))
-	}
 	ctx := metadata.NewOutgoingContext(context.Background(), md)
 
 	// Create new outbound channel and establish gRPC node stream
@@ -133,7 +129,7 @@ func newInboundNode(id uint32, addr string, msgIDGen func() uint64, handler stre
 // network. It is used for the self-node when this process is both client and
 // server in a symmetric peer configuration. The provided handler (typically
 // the local *Server) serves requests directly without a gRPC round-trip.
-func newLocalNode(id uint32, addr string, msgIDGen func() uint64, handler stream.RequestHandler, mgr *Manager) *Node {
+func newLocalNode(id uint32, addr string, msgIDGen func() uint64, handler stream.RequestHandler, mgr *outboundManager) *Node {
 	router := stream.NewMessageRouter(handler)
 	n := &Node{
 		id:       id,

@@ -17,12 +17,12 @@ type System struct {
 }
 
 // NewSystem creates a new Gorums System listening on the specified address.
-// Accepts any mix of [ServerOption], [ManagerOption], and [NodeListOption].
+// Accepts any mix of [ServerOption], [DialOption], and [NodeListOption].
 // If a [NodeListOption] is provided, an outbound [Configuration] is created
 // automatically and can be accessed via [System.OutboundConfig].
 // Returns an error if more than one [NodeListOption] is provided.
 func NewSystem(addr string, opts ...Option) (*System, error) {
-	srvOpts, mgrOpts, nodeListOpt, err := splitOptions(opts)
+	srvOpts, dialOpts, nodeListOpt, err := splitOptions(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -35,13 +35,13 @@ func NewSystem(addr string, opts ...Option) (*System, error) {
 		lis: lis,
 	}
 	if nodeListOpt != nil {
-		cfg, err := sys.newOutboundConfig(nodeListOpt, mgrOpts...)
+		cfg, err := sys.newOutboundConfig(nodeListOpt, dialOpts...)
 		if err != nil {
 			_ = lis.Close()
 			return nil, fmt.Errorf("gorums: failed to create outbound config: %w", err)
 		}
 		sys.config = cfg
-		sys.closers = append(sys.closers, cfg.Manager())
+		sys.closers = append(sys.closers, cfg)
 	}
 	return sys, nil
 }
@@ -53,7 +53,7 @@ func NewSystem(addr string, opts ...Option) (*System, error) {
 // [Configuration] is created automatically for each system and is available via
 // [System.OutboundConfig].
 //
-// The opts may contain any mix of [ServerOption] and [ManagerOption], but not [NodeListOption].
+// The opts may contain any mix of [ServerOption] and [DialOption], but not [NodeListOption].
 //
 // The returned systems are not started. Call [System.Serve] after registering
 // any services. The returned stop function stops all systems and should be
@@ -62,7 +62,7 @@ func NewSystem(addr string, opts ...Option) (*System, error) {
 // If system creation fails, all resources acquired by this function are
 // released before returning the error.
 func NewLocalSystems(n int, opts ...Option) ([]*System, func(), error) {
-	srvOpts, mgrOpts, nodeListOpt, err := splitOptions(opts)
+	srvOpts, dialOpts, nodeListOpt, err := splitOptions(opts)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -82,7 +82,7 @@ func NewLocalSystems(n int, opts ...Option) ([]*System, func(), error) {
 			srv: NewServer(sysSrvOpts...),
 			lis: listeners[i],
 		}
-		cfg, err := sys.newOutboundConfig(nodeList, mgrOpts...)
+		cfg, err := sys.newOutboundConfig(nodeList, dialOpts...)
 		if err != nil {
 			for j := range i {
 				_ = systems[j].Stop()
@@ -90,7 +90,7 @@ func NewLocalSystems(n int, opts ...Option) ([]*System, func(), error) {
 			return nil, nil, fmt.Errorf("gorums: failed to create outbound config for system %d: %w", i+1, err)
 		}
 		sys.config = cfg
-		sys.closers = append(sys.closers, cfg.Manager())
+		sys.closers = append(sys.closers, cfg)
 		systems[i] = sys
 	}
 	stop := func() {
@@ -123,15 +123,11 @@ func allocateListeners(n int) ([]net.Listener, NodeListOption, error) {
 }
 
 // newOutboundConfig creates an outbound [Configuration] for connecting to peers.
-// It always prepends a [withRequestHandler] so that the remote server can dispatch
+// It always prepends a [WithServer] option so that the remote server can dispatch
 // server-initiated requests back through the bidirectional connection, regardless of
 // whether this system has peer tracking configured.
-func (s *System) newOutboundConfig(nodeList NodeListOption, mgrOpts ...ManagerOption) (Configuration, error) {
-	opts := []Option{withRequestHandler(s.srv, s.srv.NodeID()), nodeList}
-	for _, o := range mgrOpts {
-		opts = append(opts, o)
-	}
-	return NewConfig(opts...)
+func (s *System) newOutboundConfig(nodeList NodeListOption, dialOpts ...DialOption) (Configuration, error) {
+	return NewConfig(nodeList, append([]DialOption{WithServer(s.srv)}, dialOpts...)...)
 }
 
 // OutboundConfig returns the auto-created outbound [Configuration], or nil if none was created.

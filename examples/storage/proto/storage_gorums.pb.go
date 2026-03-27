@@ -22,7 +22,6 @@ const (
 // from user code already interacting with the generated code.
 type (
 	Configuration = gorums.Configuration
-	Manager       = gorums.Manager
 	Node          = gorums.Node
 	NodeContext   = gorums.NodeContext
 	ConfigContext = gorums.ConfigContext
@@ -32,45 +31,21 @@ type (
 // This prevents users from defining message types with these names.
 var (
 	_ = (*Configuration)(nil)
-	_ = (*Manager)(nil)
 	_ = (*Node)(nil)
 	_ = (*NodeContext)(nil)
 	_ = (*ConfigContext)(nil)
 )
 
-// NewManager returns a new Manager for managing connection to nodes added
-// to the manager. This function accepts manager options used to configure
-// various aspects of the manager.
-func NewManager(opts ...gorums.ManagerOption) *Manager {
-	return gorums.NewManager(opts...)
-}
-
-// NewConfiguration returns a configuration based on the provided list of nodes.
-// Nodes can be supplied using WithNodes or WithNodeList.
-// A new configuration can also be created from an existing configuration
-// using the Add, Union, Remove, Difference, Extend, and WithoutErrors methods.
-func NewConfiguration(mgr *Manager, opt gorums.NodeListOption) (Configuration, error) {
-	return gorums.NewConfiguration(mgr, opt)
-}
-
-// NewConfig returns a new [Configuration] based on the provided [gorums.Option]s.
-// It accepts exactly one [gorums.NodeListOption] and multiple [gorums.ManagerOption]s.
-// You may use this function to create the initial configuration for a new manager.
+// NewConfig returns a new [Configuration] based on the provided nodes and dial options.
 //
 // Example:
 //
-//		cfg, err := NewConfig(
-//		    gorums.WithNodeList([]string{"localhost:8080", "localhost:8081", "localhost:8082"}),
-//	        gorums.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
-//		)
-//
-// This is a convenience function for creating a configuration without explicitly
-// creating a manager first. However, the manager can be accessed using the
-// [Configuration.Manager] method. This method should only be used once since it
-// creates a new manager; if a manager already exists, use [NewConfiguration]
-// instead, and provide the existing manager as the first argument.
-func NewConfig(opts ...gorums.Option) (Configuration, error) {
-	return gorums.NewConfig(opts...)
+//	cfg, err := NewConfig(
+//	    gorums.WithNodeList([]string{"localhost:8080", "localhost:8081", "localhost:8082"}),
+//	    gorums.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
+//	)
+func NewConfig(nodes gorums.NodeListOption, opts ...gorums.DialOption) (Configuration, error) {
+	return gorums.NewConfig(nodes, opts...)
 }
 
 // AsyncReadResponse is a future for async quorum calls returning *ReadResponse.
@@ -159,15 +134,15 @@ func ReadCorrectable(ctx *ConfigContext, in *ReadRequest, opts ...gorums.CallOpt
 
 // Storage is the server-side API for the Storage Service
 type StorageServer interface {
-	ReadRPC(ctx gorums.ServerCtx, request *ReadRequest) (response *ReadResponse, err error)
-	WriteRPC(ctx gorums.ServerCtx, request *WriteRequest) (response *WriteResponse, err error)
-	WriteUnicast(ctx gorums.ServerCtx, request *WriteRequest)
-	WriteMulticast(ctx gorums.ServerCtx, request *WriteRequest)
-	ReadQC(ctx gorums.ServerCtx, request *ReadRequest) (response *ReadResponse, err error)
-	WriteQC(ctx gorums.ServerCtx, request *WriteRequest) (response *WriteResponse, err error)
-	ReadNestedQC(ctx gorums.ServerCtx, request *ReadRequest) (response *ReadResponse, err error)
-	WriteNestedMulticast(ctx gorums.ServerCtx, request *WriteRequest) (response *WriteResponse, err error)
-	ReadCorrectable(ctx gorums.ServerCtx, request *ReadRequest, send func(response *ReadResponse) error) error
+	ReadRPC(gorums.ServerCtx, *ReadRequest) (*ReadResponse, error)
+	WriteRPC(gorums.ServerCtx, *WriteRequest) (*WriteResponse, error)
+	WriteUnicast(gorums.ServerCtx, *WriteRequest)
+	WriteMulticast(gorums.ServerCtx, *WriteRequest)
+	ReadQC(gorums.ServerCtx, *ReadRequest) (*ReadResponse, error)
+	WriteQC(gorums.ServerCtx, *WriteRequest) (*WriteResponse, error)
+	ReadNestedQC(gorums.ServerCtx, *ReadRequest) (*ReadResponse, error)
+	WriteNestedMulticast(gorums.ServerCtx, *WriteRequest) (*WriteResponse, error)
+	ReadCorrectable(gorums.ServerCtx, *ReadRequest, func(*ReadResponse))
 }
 
 func RegisterStorageServer(srv *gorums.Server, impl StorageServer) {
@@ -231,10 +206,10 @@ func RegisterStorageServer(srv *gorums.Server, impl StorageServer) {
 	})
 	srv.RegisterHandler("proto.Storage.ReadCorrectable", func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 		req := gorums.AsProto[*ReadRequest](in)
-		err := impl.ReadCorrectable(ctx, req, func(resp *ReadResponse) error {
+		impl.ReadCorrectable(ctx, req, func(resp *ReadResponse) {
 			out := gorums.NewResponseMessage(in, resp)
-			return ctx.SendMessage(out)
+			ctx.SendMessage(out)
 		})
-		return nil, err
+		return nil, nil
 	})
 }

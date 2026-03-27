@@ -17,48 +17,47 @@ type Option interface {
 	isOption()
 }
 
-// ManagerOption provides a way to set different options on a new Manager.
-type ManagerOption func(*managerOptions)
+// DialOption provides a way to set different options on a new configuration.
+type DialOption func(*dialOptions)
 
-func (ManagerOption) isOption() {}
+func (DialOption) isOption() {}
 
-type managerOptions struct {
+type dialOptions struct {
 	grpcDialOpts []grpc.DialOption
 	logger       *log.Logger
 	backoff      backoff.Config
 	sendBuffer   uint
 	metadata     metadata.MD
-	perNodeMD    func(uint32) metadata.MD
 	handler      stream.RequestHandler
 	localNodeID  uint32 // if non-zero, skip setting handler on this node ID
 }
 
-func newManagerOptions() managerOptions {
-	return managerOptions{
+func newDialOptions() dialOptions {
+	return dialOptions{
 		backoff:    backoff.DefaultConfig,
 		sendBuffer: 0,
 	}
 }
 
-// WithDialOptions returns a ManagerOption which sets any gRPC dial options
-// the Manager should use when initially connecting to each node in its pool.
-func WithDialOptions(opts ...grpc.DialOption) ManagerOption {
-	return func(o *managerOptions) {
+// WithDialOptions returns a DialOption which sets any gRPC dial options
+// the client should use when initially connecting to each node in its pool.
+func WithDialOptions(opts ...grpc.DialOption) DialOption {
+	return func(o *dialOptions) {
 		o.grpcDialOpts = append(o.grpcDialOpts, opts...)
 	}
 }
 
-// WithLogger returns a ManagerOption which sets an optional error logger for
-// the Manager.
-func WithLogger(logger *log.Logger) ManagerOption {
-	return func(o *managerOptions) {
+// WithLogger returns a DialOption which sets an optional error logger for
+// the configuration.
+func WithLogger(logger *log.Logger) DialOption {
+	return func(o *dialOptions) {
 		o.logger = logger
 	}
 }
 
 // WithBackoff allows for changing the backoff delays used by Gorums.
-func WithBackoff(backoff backoff.Config) ManagerOption {
-	return func(o *managerOptions) {
+func WithBackoff(backoff backoff.Config) DialOption {
+	return func(o *dialOptions) {
 		o.backoff = backoff
 	}
 }
@@ -66,49 +65,50 @@ func WithBackoff(backoff backoff.Config) ManagerOption {
 // WithSendBufferSize allows for changing the size of the send buffer used by Gorums.
 // A larger buffer might achieve higher throughput for asynchronous calltypes, but at
 // the cost of latency.
-func WithSendBufferSize(size uint) ManagerOption {
-	return func(o *managerOptions) {
+func WithSendBufferSize(size uint) DialOption {
+	return func(o *dialOptions) {
 		o.sendBuffer = size
 	}
 }
 
-// WithMetadata returns a ManagerOption that sets the metadata that is sent to each node
-// when the connection is initially established. This metadata can be retrieved from the
-// server-side method handlers.
-func WithMetadata(md metadata.MD) ManagerOption {
-	return func(o *managerOptions) {
-		o.metadata = md
+// WithMetadata returns a DialOption that merges md with any other metadata sent to
+// each node during connection establishment.
+// This metadata can be retrieved from the server-side method handlers.
+func WithMetadata(md metadata.MD) DialOption {
+	return func(o *dialOptions) {
+		o.metadata = metadata.Join(o.metadata, md)
 	}
 }
 
-// WithPerNodeMetadata returns a ManagerOption that allows you to set metadata for each
-// node individually.
-func WithPerNodeMetadata(f func(uint32) metadata.MD) ManagerOption {
-	return func(o *managerOptions) {
-		o.perNodeMD = f
+// WithServer returns a [DialOption] that installs srv as the back-channel request
+// handler and includes srv.NodeID() in the outgoing metadata, allowing the remote
+// endpoint to route server-initiated requests back over the bidirectional connection.
+// This option is intended for use in symmetric peer configurations, where each node
+// is both a client and a server. It will panic if srv is nil.
+//
+// NodeID semantics:
+//   - If srv.NodeID() == 0, the remote will typically treat this connection as an
+//     anonymous client and track reverse-direction calls via [ServerCtx.ClientConfig].
+//   - If srv.NodeID() > 0, the remote will treat this connection as a known peer
+//     and route requests via [ServerCtx.Config], as in symmetric peer configurations
+//     (e.g., outbound configs between replicas).
+func WithServer(srv *Server) DialOption {
+	if srv == nil {
+		panic("gorums: WithServer called with nil server")
+	}
+	return func(o *dialOptions) {
+		o.handler = srv
+		o.localNodeID = srv.NodeID()
+		o.metadata = metadata.Join(o.metadata, metadataWithNodeID(srv.NodeID()))
 	}
 }
 
-// withRequestHandler returns a ManagerOption that sets the RequestHandler used to
-// dispatch server-initiated requests arriving on the bidirectional back-channel,
-// and records localID as this node's own NodeID. The localID is included in this
-// node's outgoing metadata for each connection, enabling the server to identify
-// this replica. The handler is not installed for the self-connection (if any) to
-// avoid deadlocks in symmetric configurations.
-func withRequestHandler(handler stream.RequestHandler, localID uint32) ManagerOption {
-	return func(o *managerOptions) {
-		o.handler = handler
-		o.localNodeID = localID
-		o.metadata = metadata.Join(o.metadata, metadataWithNodeID(localID))
-	}
-}
-
-// splitOptions separates a slice of [Option]s into [ServerOption]s, [ManagerOption]s,
+// splitOptions separates a slice of [Option]s into [ServerOption]s, [DialOption]s,
 // and a single [NodeListOption]. It returns an error if more than one [NodeListOption]
 // is provided or if an unsupported option type is encountered.
-func splitOptions(opts []Option) (srvOpts []ServerOption, mgrOpts []ManagerOption, nodeListOpt NodeListOption, err error) {
+func splitOptions(opts []Option) (srvOpts []ServerOption, dialOpts []DialOption, nodeListOpt NodeListOption, err error) {
 	for _, opt := range opts {
-		// A typed interface value (e.g. ManagerOption(nil)) is not equal to nil, so we need
+		// A typed interface value (e.g. DialOption(nil)) is not equal to nil, so we need
 		// to also check if the underlying value is actually nil to avoid panics.
 		if opt == nil || reflect.ValueOf(opt).IsNil() {
 			continue
@@ -116,8 +116,8 @@ func splitOptions(opts []Option) (srvOpts []ServerOption, mgrOpts []ManagerOptio
 		switch o := opt.(type) {
 		case ServerOption:
 			srvOpts = append(srvOpts, o)
-		case ManagerOption:
-			mgrOpts = append(mgrOpts, o)
+		case DialOption:
+			dialOpts = append(dialOpts, o)
 		case NodeListOption:
 			if nodeListOpt != nil {
 				return nil, nil, nil, fmt.Errorf("gorums: multiple NodeListOptions provided")
@@ -127,5 +127,5 @@ func splitOptions(opts []Option) (srvOpts []ServerOption, mgrOpts []ManagerOptio
 			return nil, nil, nil, fmt.Errorf("gorums: unsupported option type: %T", opt)
 		}
 	}
-	return srvOpts, mgrOpts, nodeListOpt, nil
+	return srvOpts, dialOpts, nodeListOpt, nil
 }
