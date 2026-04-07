@@ -3,6 +3,7 @@ package gorums
 import (
 	"cmp"
 	"context"
+	"crypto"
 	"fmt"
 	"maps"
 	"slices"
@@ -69,15 +70,16 @@ func metadataWithNodeID(id uint32) metadata.MD {
 // inboundManager is safe for concurrent use.
 type inboundManager struct {
 	mu             sync.RWMutex
-	myID           uint32                // this server's own NodeID; always present in inboundCfg
-	nodes          map[uint32]*Node      // pre-created for known peers; client peers added on connect
-	config         Configuration         // auto-updated slice of known peer servers, sorted by ID
-	clientConfig   Configuration         // auto-updated slice of client peers, sorted by ID
-	nextMsgID      atomic.Uint64         // counter for server-initiated message IDs
-	sendBufferSize uint                  // send buffer size for inbound channels
-	handler        stream.RequestHandler // handler for dispatching incoming requests on all inbound nodes
-	onConfigChange func(Configuration)   // optional; called after each known-peer config change
-	nextClientID   uint32                // next ID to assign to a client peer
+	myID           uint32                   // this server's own NodeID; always present in inboundCfg
+	nodes          map[uint32]*Node          // pre-created for known peers; client peers added on connect
+	config         Configuration            // auto-updated slice of known peer servers, sorted by ID
+	clientConfig   Configuration            // auto-updated slice of client peers, sorted by ID
+	nextMsgID      atomic.Uint64            // counter for server-initiated message IDs
+	sendBufferSize uint                     // send buffer size for inbound channels
+	handler        stream.RequestHandler    // handler for dispatching incoming requests on all inbound nodes
+	onConfigChange func(Configuration)      // optional; called after each known-peer config change
+	nextClientID   uint32                   // next ID to assign to a client peer
+	pubKeys        map[uint32]crypto.PublicKey // expected TLS public key per known peer node ID; nil means no cert verification
 }
 
 // clientIDStart is the starting ID for dynamically assigned client peers.
@@ -95,7 +97,7 @@ const clientIDStart = 1 << 20
 // installed on the self-node (if present) to enable in-process dispatch without
 // a network round-trip. Panics on configuration errors (invalid addresses,
 // duplicate nodes, etc.)
-func newInboundManager(myID uint32, opt NodeListOption, sendBuffer uint, onConfigChange func(Configuration), handler stream.RequestHandler) *inboundManager {
+func newInboundManager(myID uint32, opt NodeListOption, sendBuffer uint, onConfigChange func(Configuration), handler stream.RequestHandler, pubKeys map[uint32]crypto.PublicKey) *inboundManager {
 	im := &inboundManager{
 		myID:           myID,
 		nodes:          make(map[uint32]*Node),
@@ -103,6 +105,7 @@ func newInboundManager(myID uint32, opt NodeListOption, sendBuffer uint, onConfi
 		handler:        handler,
 		onConfigChange: onConfigChange,
 		nextClientID:   clientIDStart,
+		pubKeys:        pubKeys,
 	}
 	if opt != nil {
 		if _, err := opt.newConfig(im); err != nil {
@@ -215,6 +218,14 @@ func (im *inboundManager) AcceptPeer(streamCtx context.Context, inboundStream st
 	nilNode := &nilPeerNode{stream: inboundStream, handler: im.handler}
 	id := nodeID(streamCtx)
 	if im.isKnown(id) {
+		// Known peer — verify TLS certificate if a public key is registered for this ID.
+		if expected, ok := im.pubKeys[id]; ok {
+			if err := verifyCertForNode(streamCtx, expected); err != nil {
+				// Certificate mismatch: accept the stream as anonymous so the
+				// connection is not dropped, but do not register as a known peer.
+				return nilNode, noop, nil
+			}
+		}
 		// Known peer — register on pre-created node.
 		return im.registerPeer(streamCtx, inboundStream, id)
 	}

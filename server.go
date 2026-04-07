@@ -2,6 +2,7 @@ package gorums
 
 import (
 	"context"
+	"crypto"
 	"net"
 
 	"github.com/relab/gorums/internal/stream"
@@ -21,6 +22,7 @@ type serverOptions struct {
 	peerOpt        NodeListOption
 	peerSendBuffer uint
 	onConfigChange func(Configuration)
+	peerPubKeys    map[uint32]crypto.PublicKey // optional; see WithPeerPublicKeys
 }
 
 // ServerOption is used to change settings for the GorumsServer
@@ -133,6 +135,7 @@ func NewServer(opts ...ServerOption) *Server {
 		serverOpts.peerSendBuffer,
 		serverOpts.onConfigChange,
 		s,
+		serverOpts.peerPubKeys,
 	)
 	s.srv = stream.NewServer(serverOpts.buffer, serverOpts.connectCallback, s.inboundManager)
 	stream.RegisterGorumsServer(s.grpcServer, s.srv)

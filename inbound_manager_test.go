@@ -62,7 +62,7 @@ func newTestInboundManager(t *testing.T, myID uint32) *inboundManager {
 		1: {"127.0.0.1:9081"},
 		2: {"127.0.0.1:9082"},
 		3: {"127.0.0.1:9083"},
-	}), 0, nil, nil)
+	}), 0, nil, nil, nil)
 	return im
 }
 
@@ -129,11 +129,11 @@ func TestNewInboundManager(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.wantPanic != "" {
 				shouldPanic(t, tc.wantPanic, func() {
-					newInboundManager(1, tc.opt, 0, nil, nil)
+					newInboundManager(1, tc.opt, 0, nil, nil, nil)
 				})
 				return
 			}
-			im := newInboundManager(1, tc.opt, 0, nil, nil)
+			im := newInboundManager(1, tc.opt, 0, nil, nil, nil)
 			nodes := im.Nodes()
 			if len(nodes) != len(tc.wantIDs) {
 				t.Fatalf("len(im.Nodes()) = %d; want %d", len(nodes), len(tc.wantIDs))
