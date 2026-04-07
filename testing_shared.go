@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/relab/gorums/internal/stream"
 	"github.com/relab/gorums/internal/testutils/mock"
 	"go.uber.org/goleak"
 	"google.golang.org/grpc"
@@ -41,8 +40,9 @@ func TestContext(t testing.TB, timeout time.Duration) context.Context {
 	return ctx
 }
 
-// InsecureDialOptions returns the default insecure gRPC dial options for testing.
-func InsecureDialOptions(_ testing.TB) ManagerOption {
+// InsecureDialOptions returns a DialOption with insecure transport credentials
+// for testing.
+func InsecureDialOptions(_ testing.TB) DialOption {
 	return WithDialOptions(
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
@@ -70,20 +70,6 @@ func TestQuorumCallError(_ testing.TB, nodeErrors map[uint32]error) QuorumCallEr
 		errs = append(errs, nodeError{cause: err, nodeID: nodeID})
 	}
 	return QuorumCallError{cause: ErrIncomplete, errors: errs}
-}
-
-// TestNodeChannel returns the current channel for the given node, or nil
-// if no channel is attached. This is intended for test inspection only.
-func TestNodeChannel(n *Node) *stream.Channel {
-	return n.channel.Load()
-}
-
-// TestManager creates a new Manager with real network dial support and any additional
-// ManagerOptions (e.g., WithMetadata). The manager is automatically closed via t.Cleanup.
-func TestManager(t testing.TB, opts ...ManagerOption) *Manager {
-	t.Helper()
-	to := &testOptions{managerOpts: opts}
-	return to.getOrCreateManager(t)
 }
 
 // TestConfiguration creates servers and a configuration for testing.
@@ -127,11 +113,13 @@ func TestConfiguration(t testing.TB, numServers int, srvFn func(i int) ServerIfa
 		testOpts.preConnectHook(stopAllFn)
 	}
 
-	mgr := testOpts.getOrCreateManager(t)
-	cfg, err := NewConfiguration(mgr, testOpts.nodeListOption(addrs))
+	// Create configuration and register its cleanup LAST so it runs FIRST (LIFO)
+	dialOptions := append([]DialOption{TestDialOptions(t)}, testOpts.managerOpts...)
+	cfg, err := NewConfig(testOpts.nodeListOption(addrs), dialOptions...)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(Closer(t, cfg))
 	return cfg
 }
 
@@ -164,8 +152,8 @@ func TestNode(t testing.TB, srvFn func(i int) ServerIface, opts ...TestOption) *
 // Example usage:
 //
 //	addrs := gorums.TestServers(t, 3, serverFn)
-//	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-//	t.Cleanup(gorums.Closer(t, mgr))
+//	cfg, err := gorums.NewConfig(gorums.WithNodeList(addrs), gorums.TestDialOptions(t))
+//	t.Cleanup(gorums.Closer(t, cfg))
 //	...
 //
 // This function can be used by other packages for testing purposes, as long as
@@ -184,11 +172,11 @@ func TestServers(t testing.TB, numServers int, srvFn func(i int) ServerIface) []
 	return addrs
 }
 
-// TestSystems starts numServers Gorums Systems using the given options function.
-// The systems are automatically stopped when the test finishes via t.Cleanup.
-// It returns a slice of the created *System objects, and their corresponding
-// outbound Configuration objects.
-func TestSystems(t testing.TB, numServers int, setup func(i int, addrs []string) ([]ServerOption, []Option)) ([]*System, []Configuration) {
+// TestSystems returns n Gorums Systems. Each system is started and
+// auto-creates an outbound [Configuration] containing the nodes of
+// the system, accessible via [System.OutboundConfig]. The systems
+// are automatically stopped when the test finishes via t.Cleanup.
+func TestSystems(t testing.TB, n int) []*System {
 	t.Helper()
 
 	// Skip goleak check for benchmarks
@@ -197,51 +185,19 @@ func TestSystems(t testing.TB, numServers int, setup func(i int, addrs []string)
 		t.Cleanup(func() { goleak.VerifyNone(t) })
 	}
 
-	addrs := make([]string, numServers)
-	systems := make([]*System, numServers)
-	configs := make([]Configuration, numServers)
-	cfgOptsList := make([][]Option, numServers)
-
-	// Pre-allocate listeners to ensure we get addresses that
-	// the systems can use in the setup function below.
-	listeners := make([]net.Listener, numServers)
-	for i := range listeners {
-		lis, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		listeners[i] = lis
-		addrs[i] = lis.Addr().String()
-	}
-
-	for i := range numServers {
-		srvOpts, cfgOpts := setup(i, addrs)
-		cfgOptsList[i] = cfgOpts
-
-		sys := &System{
-			srv: NewServer(srvOpts...),
-			lis: listeners[i],
-		}
-		systems[i] = sys
-		go sys.Serve()
+	systems, stop, err := NewLocalSystems(n, InsecureDialOptions(t))
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	// Register server cleanup SECOND so it runs BEFORE goleak check
-	t.Cleanup(func() {
-		for _, sys := range systems {
-			_ = sys.Stop()
-		}
-	})
+	t.Cleanup(stop)
 
-	for i, sys := range systems {
-		cfg, err := sys.NewOutboundConfig(cfgOptsList[i]...)
-		if err != nil {
-			t.Fatalf("Failed to create outbound config for system %d: %v", i+1, err)
-		}
-		configs[i] = cfg
+	for _, sys := range systems {
+		go sys.Serve()
 	}
 
-	return systems, configs
+	return systems
 }
 
 // ServerIface is the interface that must be implemented by a server in order to support the TestSetup function.
@@ -408,9 +364,7 @@ func StreamServerFn(_ int) ServerIface {
 		for i := 1; i <= 3; i++ {
 			resp := pb.String(fmt.Sprintf("echo: %s-%d", val, i))
 			out := NewResponseMessage(in, resp)
-			if err := ctx.SendMessage(out); err != nil {
-				return nil, err
-			}
+			ctx.SendMessage(out)
 			time.Sleep(10 * time.Millisecond)
 		}
 		return nil, nil
@@ -428,9 +382,7 @@ func StreamBenchmarkServerFn(_ int) ServerIface {
 		for i := 1; i <= 3; i++ {
 			resp := pb.String(fmt.Sprintf("echo: %s-%d", val, i))
 			out := NewResponseMessage(in, resp)
-			if err := ctx.SendMessage(out); err != nil {
-				return nil, err
-			}
+			ctx.SendMessage(out)
 		}
 		return nil, nil
 	})

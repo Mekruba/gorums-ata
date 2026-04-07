@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/relab/gorums/internal/stream"
 	"github.com/relab/gorums/internal/testutils/mock"
@@ -55,47 +56,87 @@ func printNodes(t *testing.T, nodes []*Node) {
 	}
 }
 
-// TestNodeRouteResponse verifies that Node.RouteResponse correctly routes
-// an incoming response message to a pending server-initiated call.
-func TestNodeRouteResponse(t *testing.T) {
-	n := newPeerNode(42, "127.0.0.1:9000", func() uint64 { return 0 })
-	replyChan := make(chan NodeResponse[*stream.Message], 1)
+// testRequestHandler is a minimal stream.RequestHandler that calls release
+// and signals dispatch via a channel.
+type testRequestHandler struct {
+	done chan struct{}
+}
 
-	// Register a pending call with msgID=7 on the node's router.
-	n.router.Register(7, stream.Request{
-		Ctx:          context.Background(),
-		Msg:          &stream.Message{},
-		ResponseChan: replyChan,
+func (h *testRequestHandler) HandleRequest(_ context.Context, _ *stream.Message, release func(), _ func(*stream.Message)) {
+	release()
+	close(h.done)
+}
+
+// TestNodeRouteInbound verifies that Node.RouteInbound correctly routes
+// server-initiated responses and dispatches client-initiated requests.
+func TestNodeRouteInbound(t *testing.T) {
+	t.Run("ServerInitiatedPendingDelivered", func(t *testing.T) {
+		n := newInboundNode(42, "127.0.0.1:9000", func() uint64 { return 0 }, nil)
+		replyChan := make(chan NodeResponse[*stream.Message], 1)
+		msgID := stream.ServerSequenceNumber(7)
+		n.router.Register(msgID, stream.Request{
+			Ctx:          context.Background(),
+			Msg:          &stream.Message{},
+			ResponseChan: replyChan,
+		})
+		respMsg := stream.Message_builder{MessageSeqNo: msgID}.Build()
+		released := make(chan struct{}, 1)
+		release := func() { released <- struct{}{} }
+		n.RouteInbound(context.Background(), respMsg, release, func(*stream.Message) {})
+
+		select {
+		case got := <-replyChan:
+			if got.NodeID != 42 {
+				t.Errorf("NodeID = %d, want 42", got.NodeID)
+			}
+		default:
+			t.Fatal("expected response on channel")
+		}
+		select {
+		case <-released:
+		default:
+			t.Fatal("release should be called for server-initiated response")
+		}
 	})
 
-	// Build a response message with matching msgID.
-	respMsg := stream.Message_builder{MessageSeqNo: 7}.Build()
-
-	// RouteResponse should find and deliver the pending call.
-	if !n.RouteResponse(respMsg) {
-		t.Fatal("RouteResponse should return true for a pending msgID")
-	}
-
-	// Verify the response was delivered.
-	select {
-	case got := <-replyChan:
-		if got.NodeID != 42 {
-			t.Errorf("NodeID = %d, want 42", got.NodeID)
+	t.Run("ServerInitiatedStaleAbsorbed", func(t *testing.T) {
+		n := newInboundNode(42, "127.0.0.1:9000", func() uint64 { return 0 }, nil)
+		msgID := stream.ServerSequenceNumber(7)
+		respMsg := stream.Message_builder{MessageSeqNo: msgID}.Build()
+		released := make(chan struct{}, 1)
+		release := func() { released <- struct{}{} }
+		n.RouteInbound(context.Background(), respMsg, release, func(*stream.Message) {})
+		select {
+		case <-released:
+		default:
+			t.Fatal("release should be called for stale server-initiated response")
 		}
-	default:
-		t.Fatal("expected response on channel")
-	}
+	})
 
-	// Routing the same msgID again should return false (already consumed).
-	if n.RouteResponse(respMsg) {
-		t.Error("RouteResponse should return false for consumed msgID")
-	}
+	t.Run("ClientInitiatedNilHandlerCallsRelease", func(t *testing.T) {
+		n := newInboundNode(42, "127.0.0.1:9000", func() uint64 { return 0 }, nil)
+		clientMsg := stream.Message_builder{MessageSeqNo: 1}.Build()
+		released := make(chan struct{}, 1)
+		release := func() { released <- struct{}{} }
+		n.RouteInbound(context.Background(), clientMsg, release, func(*stream.Message) {})
+		select {
+		case <-released:
+		default:
+			t.Fatal("release should be called immediately when no handler is registered")
+		}
+	})
 
-	// Unknown msgID should return false.
-	unknownMsg := stream.Message_builder{MessageSeqNo: 999}.Build()
-	if n.RouteResponse(unknownMsg) {
-		t.Error("RouteResponse should return false for unknown msgID")
-	}
+	t.Run("ClientInitiatedDispatchedToHandler", func(t *testing.T) {
+		h := &testRequestHandler{done: make(chan struct{})}
+		n := newInboundNode(42, "127.0.0.1:9000", func() uint64 { return 0 }, h)
+		clientMsg := stream.Message_builder{MessageSeqNo: 1}.Build()
+		n.RouteInbound(context.Background(), clientMsg, func() {}, func(*stream.Message) {})
+		select {
+		case <-h.done:
+		case <-time.After(time.Second):
+			t.Fatal("handler should have been called for client-initiated request")
+		}
+	})
 }
 
 // BenchmarkNodeEnqueue measures the overhead that Node.enqueue adds per
@@ -110,7 +151,7 @@ func BenchmarkNodeEnqueue(b *testing.B) {
 	b.Run("ChannelNil", func(b *testing.B) {
 		// No stream attached: channel.Load() returns nil → early return.
 		// Measures the pure atomic load + nil-guard overhead.
-		n := newPeerNode(1, "127.0.0.1:9081", func() uint64 { return 0 })
+		n := newInboundNode(1, "127.0.0.1:9081", func() uint64 { return 0 }, nil)
 		b.ResetTimer()
 		for range b.N {
 			n.Enqueue(req)
@@ -120,7 +161,7 @@ func BenchmarkNodeEnqueue(b *testing.B) {
 	b.Run("AtomicLoadNonNil", func(b *testing.B) {
 		// Stub channel attached; measures atomic.Pointer.Load() + non-nil branch
 		// without going through Channel.Enqueue (which requires a running goroutine).
-		n := newPeerNode(1, "127.0.0.1:9081", func() uint64 { return 0 })
+		n := newInboundNode(1, "127.0.0.1:9081", func() uint64 { return 0 }, nil)
 		n.channel.Store(stream.NewChannelWithState(nil))
 		b.ResetTimer()
 		for range b.N {
@@ -161,7 +202,7 @@ func BenchmarkNodeEnqueueSend(b *testing.B) {
 
 	// Wrap the outbound channel in a Node, adding the one atomic.Pointer.Load
 	// that Node.enqueue performs on every dispatch.
-	n := newPeerNode(1, lis.Addr().String(), func() uint64 { return 0 })
+	n := newInboundNode(1, lis.Addr().String(), func() uint64 { return 0 }, nil)
 	ch := stream.NewOutboundChannel(context.Background(), 1, 10, conn, n.router)
 	b.Cleanup(func() { _ = ch.Close() })
 	n.channel.Store(ch)

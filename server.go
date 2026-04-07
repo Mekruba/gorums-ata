@@ -6,6 +6,8 @@ import (
 
 	"github.com/relab/gorums/internal/stream"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // serverOptions contains configuration options for creating a new Server.
@@ -15,22 +17,24 @@ type serverOptions struct {
 	connectCallback func(context.Context)
 	interceptors    []Interceptor
 	configuration   *Configuration
-	// Peer management options (create InboundManager internally)
-	myID            uint32
-	peerOpt         NodeListOption
-	clientPeers     bool
-	peerSendBuffer  uint
-	onConfigChange  func(Configuration)
-	onClientsChange func(Configuration)
+	// Peer management options
+	myID           uint32
+	peerOpt        NodeListOption
+	peerSendBuffer uint
+	onConfigChange func(Configuration)
 }
 
 // ServerOption is used to change settings for the GorumsServer
 type ServerOption func(*serverOptions)
 
-// New server option
+func (ServerOption) isOption() {}
+
+// WithConfiguration sets a pre-built [Configuration] to use as this server's
+// peer configuration. When set, [ServerCtx.Config] returns this configuration
+// instead of the dynamic peer configuration built from [WithConfig].
 func WithConfiguration(config *Configuration) ServerOption {
 	return func(o *serverOptions) {
-		o.configuration = config // Store pointer
+		o.configuration = config
 	}
 }
 
@@ -71,38 +75,23 @@ func WithInterceptors(i ...Interceptor) ServerOption {
 	}
 }
 
-// WithConfig configures the server to track known peer servers identified by their
-// NodeID metadata. When a server connects as a client with a recognized NodeID, the
-// server registers the node and includes it in the [Configuration] returned by [Config].
-// The myID parameter is this server's own NodeID; it is always present in the [Config]
-// so that quorum thresholds account for the local replica.
-// The optional onChange callback is called after each change to the known peer [Configuration]
-// (server peer connect or disconnect). It is invoked while the manager's lock is held,
-// so it must not call [Config] or other blocking methods.
-// Use it only to signal or copy; do not perform long work inside the callback.
+// WithConfig configures the server to track a fixed set of peer servers.
+// When a recognized peer connects, it is included in the [Configuration]
+// returned by [Config]. The myID parameter is this server's own NodeID;
+// it is always present in the [Config] so that quorum thresholds account
+// for the local replica.
+//
+// The optional onChange callback is called after each change to the known
+// peer [Configuration] (server peer connect or disconnect). It is invoked
+// while any internal locks are held, so it must not call [Config] or other
+// blocking methods. Use it only to signal or copy; do not perform long
+// work inside the callback.
 func WithConfig(myID uint32, opt NodeListOption, onChange ...func(Configuration)) ServerOption {
 	return func(o *serverOptions) {
 		o.myID = myID
 		o.peerOpt = opt
 		if len(onChange) > 0 {
 			o.onConfigChange = onChange[0]
-		}
-	}
-}
-
-// WithClientConfig enables the server to accept unknown clients (those without
-// a recognized NodeID). Each unknown client is assigned a sequential auto-generated
-// ID and included in the [Configuration] returned by [ClientConfig]. Client nodes are
-// removed when they disconnect. Can be combined with [WithConfig] for mixed mode.
-// The optional onChange callback is called after each change to the [ClientConfig]
-// (client peer connect or disconnect). It is invoked while the manager's lock is held,
-// so it must not call [ClientConfig] or other blocking methods.
-// Use it only to signal or copy; do not perform long work inside the callback.
-func WithClientConfig(onChange ...func(Configuration)) ServerOption {
-	return func(o *serverOptions) {
-		o.clientPeers = true
-		if len(onChange) > 0 {
-			o.onClientsChange = onChange[0]
 		}
 	}
 }
@@ -122,13 +111,18 @@ type Server struct {
 	grpcServer   *grpc.Server
 	handlers     map[string]Handler
 	interceptors []Interceptor
-	inboundMgr   *InboundManager // nil if no peers configured
-	staticConfig *Configuration  // static configuration passed via WithConfiguration
+	staticConfig *Configuration // static configuration passed via WithConfiguration
+	*inboundManager
 }
 
 // NewServer returns a new instance of [Server].
-// If [WithConfig] or [WithClientConfig] options are provided, an InboundManager is
-// created internally to track connected peers.
+//
+// The server tracks connected clients that are capable of receiving reverse-direction
+// calls from the server; these clients are accessible via [ServerCtx.ClientConfig]
+// and [Server.ClientConfig]. If [WithConfig] is provided, the server additionally
+// tracks a fixed set of peer servers, which are accessible via [ServerCtx.Config]
+// and [Server.Config].
+//
 // Panics on configuration errors (invalid addresses, duplicate nodes, etc.)
 // since these are programmer errors detectable at startup.
 func NewServer(opts ...ServerOption) *Server {
@@ -136,42 +130,25 @@ func NewServer(opts ...ServerOption) *Server {
 	for _, opt := range opts {
 		opt(&serverOpts)
 	}
-	var acceptor *InboundManager
-	if serverOpts.peerOpt != nil || serverOpts.clientPeers {
-		acceptor = newInboundManager(serverOpts.myID, serverOpts.peerOpt, serverOpts.peerSendBuffer, serverOpts.onConfigChange, serverOpts.onClientsChange, serverOpts.clientPeers)
-	}
+	// Allocate s first so it can serve as the selfHandler for the inboundManager.
+	// HandleRequest only accesses s.handlers and s.interceptors, both of which are
+	// set below before newInboundManager is called, so the reference is safe to pass.
 	s := &Server{
 		grpcServer:   grpc.NewServer(serverOpts.grpcOpts...),
 		handlers:     make(map[string]Handler),
 		interceptors: serverOpts.interceptors,
-		inboundMgr:   acceptor,
 		staticConfig: serverOpts.configuration,
 	}
-	s.srv = stream.NewServer(serverOpts.buffer, acceptor, serverOpts.connectCallback, s)
+	s.inboundManager = newInboundManager(
+		serverOpts.myID,
+		serverOpts.peerOpt,
+		serverOpts.peerSendBuffer,
+		serverOpts.onConfigChange,
+		s,
+	)
+	s.srv = stream.NewServer(serverOpts.buffer, serverOpts.connectCallback, s.inboundManager)
 	stream.RegisterGorumsServer(s.grpcServer, s.srv)
 	return s
-}
-
-// Config returns a [Configuration] of all connected known peers, plus this node.
-// The returned slice is replaced atomically on each connect/disconnect;
-// retaining a reference to an old configuration is safe.
-// Returns nil if no peer tracking is configured.
-func (s *Server) Config() Configuration {
-	if s.inboundMgr == nil {
-		return nil
-	}
-	return s.inboundMgr.Config()
-}
-
-// ClientConfig returns a [Configuration] of all connected client peers.
-// The returned slice is replaced atomically on each connect/disconnect;
-// retaining a reference to an old value is safe.
-// Returns nil if no peer tracking is configured.
-func (s *Server) ClientConfig() Configuration {
-	if s.inboundMgr == nil {
-		return nil
-	}
-	return s.inboundMgr.ClientConfig()
 }
 
 // RegisterHandler registers a request handler for the specified method name.
@@ -184,6 +161,11 @@ func (s *Server) RegisterHandler(method string, handler Handler) {
 // HandleRequest processes an incoming request from the stream, dispatching it
 // to the appropriate registered handler. It serves as the bridge between the
 // multiplexing in the stream package and the RPC logic in the gorums package.
+//
+// send is invoked in two infrastructure-level error cases regardless of call type:
+// no handler is registered for the method, or the request cannot be unmarshaled.
+// For requests that reach the handler: one-way handlers return nil, nil and send
+// is not invoked; two-way handlers return a response which is delivered via send.
 //
 // This is the "default interceptor"; it is the first and last handler in the chain.
 // It is responsible for releasing the mutex when the handler chain is done,
@@ -199,14 +181,15 @@ func (s *Server) HandleRequest(ctx context.Context, reqMsg *stream.Message, rele
 
 	handler, ok := s.handlers[reqMsg.GetMethod()]
 	if !ok {
-		// No handler registered: we just ignore the message and release the lock.
+		in := &Message{Message: reqMsg}
+		srvCtx.SendMessage(MessageWithError(in, nil, status.Errorf(codes.Unimplemented, "no handler registered for method %s", reqMsg.GetMethod())))
 		return
 	}
 
 	msg, err := unmarshalRequest(reqMsg)
 	in := &Message{Msg: msg, Message: reqMsg}
 	if err != nil {
-		_ = srvCtx.SendMessage(MessageWithError(in, nil, err))
+		srvCtx.SendMessage(MessageWithError(in, nil, err))
 		return
 	}
 
@@ -217,7 +200,7 @@ func (s *Server) HandleRequest(ctx context.Context, reqMsg *stream.Message, rele
 	if out == nil && err == nil {
 		return
 	}
-	_ = srvCtx.SendMessage(MessageWithError(in, out, err))
+	srvCtx.SendMessage(MessageWithError(in, out, err))
 }
 
 // Serve starts serving on the listener.
@@ -234,3 +217,6 @@ func (s *Server) GracefulStop() {
 func (s *Server) Stop() {
 	s.grpcServer.Stop()
 }
+
+// compile-time assertion for interface compliance.
+var _ stream.RequestHandler = (*Server)(nil)

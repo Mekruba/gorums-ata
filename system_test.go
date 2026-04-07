@@ -1,7 +1,11 @@
 package gorums_test
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"net"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -22,7 +26,7 @@ func (m *mockCloser) Close() error {
 	return m.err
 }
 
-func TestSystemLifecycle(t *testing.T) {
+func TestSystemStopClosesRegisteredServices(t *testing.T) {
 	sys, err := gorums.NewSystem("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to create system: %v", err)
@@ -62,7 +66,7 @@ func TestSystemLifecycle(t *testing.T) {
 	}
 }
 
-func TestSystemStopError(t *testing.T) {
+func TestSystemStopReturnsCloserError(t *testing.T) {
 	sys, err := gorums.NewSystem("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to create system: %v", err)
@@ -83,13 +87,58 @@ func TestSystemStopError(t *testing.T) {
 	}
 }
 
-func TestSystemSymmetricConfiguration(t *testing.T) {
-	systems, configs := createTestSystems(t, 3)
+// TestSystemStopBeforeServeClosesListener verifies that Stop closes the
+// pre-allocated listener even when Serve was never called, so no file
+// descriptor is leaked.
+func TestSystemStopBeforeServeClosesListener(t *testing.T) {
+	sys, err := gorums.NewSystem("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewSystem: %v", err)
+	}
+	addr := sys.Addr()
+	if err := sys.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	// The listener should be closed now; re-binding to the same address must succeed.
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Errorf("expected to re-bind to %s after Stop (without Serve), got: %v", addr, err)
+		return
+	}
+	_ = lis.Close()
+}
 
-	// Each replica connects to the other two via System.NewOutboundConfig
-	// (NodeID is automatically included in metadata)
+// TestNewLocalSystemsStopBeforeServeClosesListeners verifies that the stop function
+// returned by NewLocalSystems closes all pre-allocated listeners even when none of
+// the systems has had Serve called yet, so no file descriptors are leaked.
+func TestNewLocalSystemsStopBeforeServeClosesListeners(t *testing.T) {
+	systems, stop, err := gorums.NewLocalSystems(3, gorums.InsecureDialOptions(t))
+	if err != nil {
+		t.Fatalf("NewLocalSystems: %v", err)
+	}
+	addrs := make([]string, len(systems))
 	for i, sys := range systems {
-		sys.RegisterService(configs[i].Manager(), func(*gorums.Server) {
+		addrs[i] = sys.Addr()
+	}
+	stop() // called before any Serve()
+	// Every pre-allocated listener must be closed; re-binding must succeed.
+	for _, addr := range addrs {
+		lis, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Errorf("expected to re-bind to %s after stop (without Serve), got: %v", addr, err)
+			continue
+		}
+		_ = lis.Close()
+	}
+}
+
+func TestSystemSymmetricConfigurationConnectsAllPeers(t *testing.T) {
+	systems := gorums.TestSystems(t, 3)
+
+	// Outbound config is auto-created by NewLocalSystems.
+	// (NodeID is automatically included in connection metadata)
+	for _, sys := range systems {
+		sys.RegisterService(nil, func(*gorums.Server) {
 			// Register mock handlers for the server sides if needed for other tests
 		})
 	}
@@ -103,25 +152,6 @@ func TestSystemSymmetricConfiguration(t *testing.T) {
 			t.Fatalf("system %d config size: %d, expected: %d", i+1, got, len(systems))
 		}
 	}
-}
-
-func createTestSystems(t *testing.T, numSystems int) ([]*gorums.System, []gorums.Configuration) {
-	systems, configs := gorums.TestSystems(t, numSystems, func(i int, addrs []string) ([]gorums.ServerOption, []gorums.Option) {
-		myID := uint32(i + 1)
-
-		nodeList := gorums.WithNodeList(addrs)
-		srvOpts := []gorums.ServerOption{
-			gorums.WithConfig(myID, nodeList),
-		}
-
-		cfgOpts := []gorums.Option{
-			nodeList,
-			gorums.InsecureDialOptions(t),
-		}
-
-		return srvOpts, cfgOpts
-	})
-	return systems, configs
 }
 
 // waitWithTimeout waits for wg to reach zero or calls t.Fatal if the timeout elapses.
@@ -156,16 +186,40 @@ func awaitClientReady(t *testing.T, sys *gorums.System, n int) {
 	})
 }
 
-// createClientServerSystems creates two systems configured for client-server testing.
-// System 0 acts as the server (both systems use WithClientConfig so the server can
-// reach clients back via their inbound channels). Both systems dial system 0's address
-// so that system 1 appears in system 0's ClientConfig, and system 0 has a self-connection.
-func createClientServerSystems(t *testing.T) ([]*gorums.System, []gorums.Configuration) {
+// createClientServerSystems creates a server system and a client for back-channel testing.
+// The server automatically tracks anonymous clients and can dispatch reverse-direction
+// calls to them via [ServerCtx.ClientConfig].
+// The client is a standalone [*gorums.Server] (no listener needed) whose registered handlers
+// are reachable by the server over the existing bidirectional gRPC stream. The returned
+// [gorums.Configuration] is the client's outbound config pointing at the server.
+func createClientServerSystems(t *testing.T) (*gorums.System, *gorums.Server, gorums.Configuration) {
 	t.Helper()
-	return gorums.TestSystems(t, 2, func(_ int, addrs []string) ([]gorums.ServerOption, []gorums.Option) {
-		return []gorums.ServerOption{gorums.WithClientConfig()},
-			[]gorums.Option{gorums.WithNodeList([]string{addrs[0]}), gorums.InsecureDialOptions(t)}
+
+	// Server side: accepts anonymous clients for reverse-direction calls.
+	sys, err := gorums.NewSystem("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Client side: a plain Server whose handlers the server can invoke via the back-channel.
+	// No listener is required — dispatch is over the client's outbound gRPC stream.
+	clientSrv := gorums.NewServer()
+
+	// The client dials the server; WithServer wires up the back-channel dispatcher.
+	nodeList := gorums.WithNodeList([]string{sys.Addr()})
+	cfg, err := gorums.NewConfig(nodeList, gorums.WithServer(clientSrv), gorums.InsecureDialOptions(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() { _ = sys.Serve() }()
+
+	t.Cleanup(func() {
+		_ = cfg.Close()
+		_ = sys.Stop()
 	})
+
+	return sys, clientSrv, cfg
 }
 
 // stringEchoHandler returns a handler that replies with prefix+": "+request value.
@@ -228,12 +282,12 @@ func outerChainedHandler(
 	}
 }
 
-func TestSystemSymmetricConfigurationQuorumCall(t *testing.T) {
-	systems, configs := createTestSystems(t, 3)
+func TestSystemSymmetricConfigurationRoutesQuorumCalls(t *testing.T) {
+	systems := gorums.TestSystems(t, 3)
 
 	// Register mock handler to each system
-	for i, sys := range systems {
-		sys.RegisterService(configs[i].Manager(), func(srv *gorums.Server) {
+	for _, sys := range systems {
+		sys.RegisterService(nil, func(srv *gorums.Server) {
 			srv.RegisterHandler(mock.TestMethod, stringEchoHandler("echo"))
 		})
 	}
@@ -264,8 +318,8 @@ func TestSystemSymmetricConfigurationQuorumCall(t *testing.T) {
 		},
 	}
 
-	// Use the explicit config from node 1 outbound.
-	cfg := configs[0]
+	// Use the auto-created outbound config from system 0.
+	cfg := systems[0].OutboundConfig()
 	// Sub tests for each response type logic across symmetric routing
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -289,15 +343,15 @@ func TestSystemSymmetricConfigurationQuorumCall(t *testing.T) {
 	}
 }
 
-func TestSystemSymmetricConfigurationMulticast(t *testing.T) {
-	systems, configs := createTestSystems(t, 3)
+func TestSystemSymmetricConfigurationRoutesMulticast(t *testing.T) {
+	systems := gorums.TestSystems(t, 3)
 
 	var wg sync.WaitGroup
 	wg.Add(len(systems))
 
 	// Register mock handler to each system
-	for i, sys := range systems {
-		sys.RegisterService(configs[i].Manager(), func(srv *gorums.Server) {
+	for _, sys := range systems {
+		sys.RegisterService(nil, func(srv *gorums.Server) {
 			srv.RegisterHandler(mock.Stream, func(_ gorums.ServerCtx, _ *gorums.Message) (*gorums.Message, error) {
 				wg.Done()
 				return nil, nil
@@ -307,7 +361,7 @@ func TestSystemSymmetricConfigurationMulticast(t *testing.T) {
 
 	awaitSystemReady(t, systems)
 
-	cfg := configs[0]
+	cfg := systems[0].OutboundConfig()
 	ctx := gorums.TestContext(t, 2*time.Second)
 	err := gorums.Multicast(
 		cfg.Context(ctx),
@@ -321,61 +375,17 @@ func TestSystemSymmetricConfigurationMulticast(t *testing.T) {
 	waitWithTimeout(t, &wg)
 }
 
-func TestSystemStreamDeduplicated(t *testing.T) {
-	// An initial draft implementation of the stream dedup logic was accidentally
-	// merged (by Gemini 3.1 Pro), and reverted in commit e321c832b71cc1.
-	// Stream deduplication is tracked by issue #279: We will re-enable this
-	// test once we reintroduce stream deduplication logic in a future PR.
-	t.Skip("Temporarily skipping since I've rolled back the stream deduplication changes.")
-	systems, configs := createTestSystems(t, 3)
+func TestSystemHandlerCanMulticastViaConfig(t *testing.T) {
+	systems := gorums.TestSystems(t, 3)
 
-	// Register echo handler to each system
-	for i, sys := range systems {
-		sys.RegisterService(configs[i].Manager(), func(srv *gorums.Server) {
-			srv.RegisterHandler(mock.TestMethod, stringEchoHandler("echo"))
-		})
-	}
-
-	awaitSystemReady(t, systems)
-
-	// Verify stream dedup: for each peer pair, exactly one side should have
-	// an outbound channel. The lower-ID node keeps its outbound.
-	for i, cfg := range configs {
-		myID := uint32(i + 1)
-		for _, node := range cfg.Nodes() {
-			peerID := node.ID()
-			if peerID == myID {
-				continue // skip self
-			}
-			ch := gorums.TestNodeChannel(node)
-			if myID < peerID {
-				// Lower-ID node: should have outbound channel (conn != nil)
-				if ch == nil {
-					t.Errorf("system %d -> peer %d: expected outbound channel; got nil", myID, peerID)
-				} else if ch.IsInbound() {
-					t.Errorf("system %d -> peer %d: expected outbound channel; got inbound", myID, peerID)
-				}
-			} else {
-				// Higher-ID node: should have no outbound channel (waiting for inbound)
-				if ch != nil && !ch.IsInbound() {
-					t.Errorf("system %d -> peer %d: expected no outbound channel; got outbound", myID, peerID)
-				}
-			}
-		}
-	}
-}
-
-func TestSystemSymmetricMulticastFromHandler_Config(t *testing.T) {
-	systems, configs := createTestSystems(t, 3)
-
-	// 3 servers receive the outer multicast. each server multicasts to a config of 3 nodes.
-	// however, self-node enqueues are silently dropped in gorums, so each server only sends to 2 peers.
-	// total = 3 * 2 = 6 messages received.
+	// 3 servers receive the outer multicast. Each server multicasts to a config of 3 nodes.
+	// The self-node's handler is invoked locally, so each server sends to all 3 nodes.
+	// Total = 3 * 3 = 9 messages received.
 	var wg sync.WaitGroup
-	wg.Add(6)
+	wg.Add(9)
 
 	for i, sys := range systems {
-		sys.RegisterService(configs[i].Manager(), func(srv *gorums.Server) {
+		sys.RegisterService(nil, func(srv *gorums.Server) {
 			srv.RegisterHandler(mock.TestMethod, func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 				t.Logf("System %d received multicast on %v: %v", i+1, mock.TestMethod, in.Msg)
 				if cfg := ctx.Config(); cfg != nil && cfg.Size() == 3 {
@@ -401,7 +411,7 @@ func TestSystemSymmetricMulticastFromHandler_Config(t *testing.T) {
 
 	awaitSystemReady(t, systems)
 
-	cfg := configs[0]
+	cfg := systems[0].OutboundConfig()
 	ctx := gorums.TestContext(t, 2*time.Second)
 	err := gorums.Multicast(
 		cfg.Context(ctx),
@@ -415,59 +425,86 @@ func TestSystemSymmetricMulticastFromHandler_Config(t *testing.T) {
 	waitWithTimeout(t, &wg)
 }
 
-func TestSystemChainedQuorumCallFromHandler_Config(t *testing.T) {
-	systems, configs := createTestSystems(t, 3)
+func TestSystemHandlerCanChainQuorumCallViaConfig(t *testing.T) {
+	type respType = *gorums.Responses[*pb.StringValue]
 
-	for i, sys := range systems {
-		myID := i + 1
-		sys.RegisterService(configs[i].Manager(), func(srv *gorums.Server) {
-			// Outer handler fans out to EchoMethod; inner handler replies directly.
-			srv.RegisterHandler(mock.TestMethod, outerChainedHandler(t, myID, false, mock.EchoMethod, (*gorums.Responses[*pb.StringValue]).Majority))
-			srv.RegisterHandler(mock.EchoMethod, stringEchoHandler("inner-echo"))
+	// seqAll drains the Seq iterator to exhaustion and returns the last value.
+	// This is the regression path for the self-node dispatch bug where .Seq()
+	// and .All() would time out when self was included in the quorum.
+	seqAll := func(r respType) (*pb.StringValue, error) {
+		var last *pb.StringValue
+		for result := range r.Seq() {
+			if result.Err != nil {
+				return nil, result.Err
+			}
+			last = result.Value
+		}
+		if last == nil {
+			return nil, errors.New("Seq: no responses received")
+		}
+		return last, nil
+	}
+
+	tests := []struct {
+		name    string
+		innerFn func(respType) (*pb.StringValue, error)
+		outerFn func(respType) (*pb.StringValue, error)
+	}{
+		{name: "Majority", innerFn: respType.Majority, outerFn: respType.Majority},
+		{name: "All", innerFn: respType.All, outerFn: respType.All}, // Regression: .All() must not time out when self-node is included.
+		{name: "Seq", innerFn: seqAll, outerFn: respType.All},       // Regression: draining .Seq() to exhaustion must not time out when self-node is included.
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			systems := gorums.TestSystems(t, 3)
+
+			for i, sys := range systems {
+				myID := i + 1
+				sys.RegisterService(nil, func(srv *gorums.Server) {
+					srv.RegisterHandler(mock.TestMethod, outerChainedHandler(t, myID, false, mock.EchoMethod, tt.innerFn))
+					srv.RegisterHandler(mock.EchoMethod, stringEchoHandler("inner-echo"))
+				})
+			}
+
+			awaitSystemReady(t, systems)
+
+			cfg := systems[0].OutboundConfig()
+			ctx := gorums.TestContext(t, 2*time.Second)
+
+			responses := gorums.QuorumCall[*pb.StringValue, *pb.StringValue](
+				cfg.Context(ctx),
+				pb.String("outer-call"),
+				mock.TestMethod,
+			)
+			result, err := tt.outerFn(responses)
+			if err != nil {
+				t.Fatalf("quorum call error: %v", err)
+			}
+			t.Logf("Final result: %s", result.GetValue())
+
+			wantResult := "outer-call | inner-echo: outer-call"
+			if !strings.Contains(result.GetValue(), wantResult) {
+				t.Errorf("Expected %q in result, got: %s", wantResult, result.GetValue())
+			}
 		})
-	}
-
-	awaitSystemReady(t, systems)
-
-	cfg := configs[0]
-	ctx := gorums.TestContext(t, 2*time.Second)
-
-	responses := gorums.QuorumCall[*pb.StringValue, *pb.StringValue](
-		cfg.Context(ctx),
-		pb.String("outer-call"),
-		mock.TestMethod,
-	)
-	result, err := responses.Majority()
-	if err != nil {
-		t.Fatalf("quorum call error: %v", err)
-	}
-	t.Logf("Final result: %s", result.GetValue())
-
-	wantResult := "outer-call | inner-echo: outer-call"
-	if !strings.Contains(result.GetValue(), wantResult) {
-		t.Errorf("Expected %q in result, got: %s", wantResult, result.GetValue())
 	}
 }
 
-func TestSystemChainedQuorumCallFromHandler_ClientConfig(t *testing.T) {
-	systems, configs := createClientServerSystems(t)
-	sysServer, sysClient := systems[0], systems[1]
+func TestSystemHandlerCanChainQuorumCallViaClientConfig(t *testing.T) {
+	sysServer, clientSrv, cfgClient := createClientServerSystems(t)
 
 	// Server: outer handler fans out an inner quorum call on EchoMethod to all
-	// client peers (self-connection + system 1) and returns whichever responds first.
-	sysServer.RegisterService(configs[0].Manager(), func(srv *gorums.Server) {
+	// client peers and returns whichever responds first.
+	sysServer.RegisterService(nil, func(srv *gorums.Server) {
 		srv.RegisterHandler(mock.TestMethod, outerChainedHandler(t, 1, true, mock.EchoMethod, (*gorums.Responses[*pb.StringValue]).First))
-		srv.RegisterHandler(mock.EchoMethod, stringEchoHandler("server-echo"))
 	})
 
-	// Client: echoes inner quorum calls back with a prefix.
-	sysClient.RegisterService(configs[1].Manager(), func(srv *gorums.Server) {
-		srv.RegisterHandler(mock.EchoMethod, stringEchoHandler("client-echo"))
-	})
+	// Client: handles EchoMethod calls dispatched back by the server via ClientConfig.
+	clientSrv.RegisterHandler(mock.EchoMethod, stringEchoHandler("client-echo"))
 
-	awaitClientReady(t, sysServer, 2)
+	awaitClientReady(t, sysServer, 1)
 
-	cfgClient := configs[1]
 	ctx := gorums.TestContext(t, 2*time.Second)
 	responses := gorums.QuorumCall[*pb.StringValue, *pb.StringValue](
 		cfgClient.Context(ctx),
@@ -479,30 +516,25 @@ func TestSystemChainedQuorumCallFromHandler_ClientConfig(t *testing.T) {
 		t.Fatalf("quorum call error: %v", err)
 	}
 	t.Logf("CLIENT final result: %v", result.GetValue())
-	// The prefix is always "outer-call | "; the suffix depends on which peer
-	// won the inner First() race:
-	//   self-connection → "server-echo: outer-call"
-	//   system 1        → "client-echo: outer-call"
+	// The server fans out EchoMethod to ClientConfig (client only).
+	// Result: "outer-call | client-echo: outer-call"
 	if !strings.HasPrefix(result.GetValue(), "outer-call | ") {
 		t.Errorf("Expected result to start with %q, got %q", "outer-call | ", result.GetValue())
 	}
 }
 
-func TestSystemSymmetricMulticastFromHandler_ClientConfig(t *testing.T) {
-	systems, configs := createClientServerSystems(t)
+func TestSystemHandlerCanMulticastViaClientConfig(t *testing.T) {
+	sysServer, clientSrv, cfgClient := createClientServerSystems(t)
 
-	// Outer multicast from client triggers 1 server handler.
-	// That server handler multicasts to config of size 2 -> 2 messages sent.
-	// So wg expects 2 receives.
+	// Outer multicast from client triggers the server handler once.
+	// The server fans out an inner multicast via ClientConfig (1 client) -> 1 message.
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(1)
 
-	sysServer, sysClient := systems[0], systems[1]
-
-	sysServer.RegisterService(configs[0].Manager(), func(srv *gorums.Server) {
+	sysServer.RegisterService(nil, func(srv *gorums.Server) {
 		srv.RegisterHandler(mock.TestMethod, func(ctx gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
 			t.Logf("SERVER received multicast: %v", in.Msg)
-			if cfg := ctx.ClientConfig(); cfg != nil && cfg.Size() == 2 {
+			if cfg := ctx.ClientConfig(); cfg != nil && cfg.Size() == 1 {
 				err := gorums.Multicast(
 					cfg.Context(t.Context()),
 					pb.String("inner-call"),
@@ -514,24 +546,17 @@ func TestSystemSymmetricMulticastFromHandler_ClientConfig(t *testing.T) {
 			}
 			return nil, nil // one-way
 		})
-		srv.RegisterHandler(mock.Stream, func(_ gorums.ServerCtx, _ *gorums.Message) (*gorums.Message, error) {
-			t.Log("SERVER received inner multicast")
-			wg.Done()
-			return nil, nil
-		})
 	})
 
-	sysClient.RegisterService(configs[1].Manager(), func(srv *gorums.Server) {
-		srv.RegisterHandler(mock.Stream, func(_ gorums.ServerCtx, _ *gorums.Message) (*gorums.Message, error) {
-			t.Log("CLIENT received inner multicast")
-			wg.Done()
-			return nil, nil
-		})
+	// Client handles the reverse-direction multicast dispatched by the server.
+	clientSrv.RegisterHandler(mock.Stream, func(_ gorums.ServerCtx, _ *gorums.Message) (*gorums.Message, error) {
+		t.Log("CLIENT received inner multicast")
+		wg.Done()
+		return nil, nil
 	})
 
-	awaitClientReady(t, sysServer, 2)
+	awaitClientReady(t, sysServer, 1)
 
-	cfgClient := configs[1]
 	ctx := gorums.TestContext(t, 2*time.Second)
 	err := gorums.Multicast(
 		cfgClient.Context(ctx),
@@ -543,4 +568,181 @@ func TestSystemSymmetricMulticastFromHandler_ClientConfig(t *testing.T) {
 	}
 
 	waitWithTimeout(t, &wg)
+}
+
+// TestSystemLocalDispatchContention verifies that sequential quorum calls remain
+// correct when an earlier call returns before all replicas have replied and the
+// next call starts immediately on the same configuration.
+//
+// Gorums only guarantees FIFO ordering for sequentially issued quorum calls.
+// Concurrent quorum calls (from separate goroutines) violate the FIFO ordering
+// contract (see doc/ordering.md) and are therefore not tested.
+//
+// Each subtest creates its own isolated systems so that goroutines left over
+// from one subtest cannot contaminate the next.
+func TestSystemLocalDispatchContention(t *testing.T) {
+	startSystems := func(t *testing.T) gorums.Configuration {
+		t.Helper()
+		systems := gorums.TestSystems(t, 3)
+		for _, sys := range systems {
+			sys.RegisterService(nil, func(srv *gorums.Server) {
+				srv.RegisterHandler(mock.TestMethod, func(_ gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
+					req := gorums.AsProto[*pb.StringValue](in)
+					return gorums.NewResponseMessage(in, pb.String("echo: "+req.GetValue())), nil
+				})
+			})
+		}
+		awaitSystemReady(t, systems)
+		return systems[0].OutboundConfig()
+	}
+
+	const delay = 2000 * time.Millisecond
+
+	// SequentialMajorityThenAll exercises the common case where a quorum-sized
+	// result is returned first and a full-result call follows immediately after.
+	t.Run("SequentialMajorityThenAll", func(t *testing.T) {
+		cfg := startSystems(t)
+		const iterations = 500
+		for i := range iterations {
+			ctx, cancel := context.WithTimeout(t.Context(), delay)
+			responses := gorums.QuorumCall[*pb.StringValue, *pb.StringValue](
+				cfg.Context(ctx),
+				pb.String(fmt.Sprintf("m-%d", i)),
+				mock.TestMethod,
+			)
+			if _, err := responses.Majority(); err != nil {
+				cancel()
+				t.Fatalf("iteration %d: Majority: %v", i, err)
+			}
+			cancel()
+
+			ctx, cancel = context.WithTimeout(t.Context(), delay)
+			responses = gorums.QuorumCall[*pb.StringValue, *pb.StringValue](
+				cfg.Context(ctx),
+				pb.String(fmt.Sprintf("a-%d", i)),
+				mock.TestMethod,
+			)
+			if _, err := responses.All(); err != nil {
+				cancel()
+				t.Fatalf("iteration %d: All: %v", i, err)
+			}
+			cancel()
+		}
+	})
+
+	// GOMAXPROCS1 uses the earliest-returning terminal method first and then
+	// immediately requires all replies, while constraining scheduling to
+	// amplify timing-sensitive ordering bugs.
+	t.Run("GOMAXPROCS1", func(t *testing.T) {
+		prev := runtime.GOMAXPROCS(1)
+		defer runtime.GOMAXPROCS(prev)
+
+		cfg := startSystems(t)
+		const iterations = 500
+		for i := range iterations {
+			ctx, cancel := context.WithTimeout(t.Context(), delay)
+			responses := gorums.QuorumCall[*pb.StringValue, *pb.StringValue](
+				cfg.Context(ctx),
+				pb.String(fmt.Sprintf("g-%d", i)),
+				mock.TestMethod,
+			)
+			if _, err := responses.First(); err != nil {
+				cancel()
+				t.Fatalf("iteration %d: First: %v", i, err)
+			}
+			cancel()
+
+			ctx, cancel = context.WithTimeout(t.Context(), delay)
+			responses = gorums.QuorumCall[*pb.StringValue, *pb.StringValue](
+				cfg.Context(ctx),
+				pb.String(fmt.Sprintf("ga-%d", i)),
+				mock.TestMethod,
+			)
+			if _, err := responses.All(); err != nil {
+				cancel()
+				t.Fatalf("iteration %d: All: %v", i, err)
+			}
+			cancel()
+		}
+	})
+}
+
+// TestSystemLocalDispatchContentionSlowReplica verifies that a slow local
+// replica does not prevent a new quorum call from making progress on replies
+// from the remote replicas.
+//
+// The test first lets a remote reply satisfy an early-returning call while the
+// local replica is intentionally delayed, then immediately issues an All call.
+// The All call must observe remote progress right away and complete once the
+// delayed local reply is finally allowed through.
+func TestSystemLocalDispatchContentionSlowReplica(t *testing.T) {
+	systems := gorums.TestSystems(t, 3)
+
+	// blocker delays system 0's handler so its reply is intentionally late.
+	blocker := make(chan struct{})
+	closeBlocker := sync.OnceFunc(func() { close(blocker) })
+	t.Cleanup(closeBlocker) // safety net: unblock handler goroutines on test exit
+
+	for i, sys := range systems {
+		if i == 0 {
+			// System 0 (self-node): block until signaled.
+			sys.RegisterService(nil, func(srv *gorums.Server) {
+				srv.RegisterHandler(mock.TestMethod, func(_ gorums.ServerCtx, in *gorums.Message) (*gorums.Message, error) {
+					<-blocker
+					req := gorums.AsProto[*pb.StringValue](in)
+					return gorums.NewResponseMessage(in, pb.String("echo: "+req.GetValue())), nil
+				})
+			})
+		} else {
+			// Systems 1, 2 (remote): respond immediately.
+			sys.RegisterService(nil, func(srv *gorums.Server) {
+				srv.RegisterHandler(mock.TestMethod, stringEchoHandler("echo"))
+			})
+		}
+	}
+
+	awaitSystemReady(t, systems)
+	cfg := systems[0].OutboundConfig()
+
+	// Step 1: First(1) succeeds from a remote response while the local reply is
+	// still blocked.
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	responses := gorums.QuorumCall[*pb.StringValue, *pb.StringValue](
+		cfg.Context(ctx),
+		pb.String("first-call"),
+		mock.TestMethod,
+	)
+	result, err := responses.First()
+	cancel()
+	if err != nil {
+		closeBlocker()
+		t.Fatalf("First: %v", err)
+	}
+	if result.GetValue() != "echo: first-call" {
+		closeBlocker()
+		t.Fatalf("First: got %q, want %q", result.GetValue(), "echo: first-call")
+	}
+
+	// Step 2: Release the delayed local reply after a short pause.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		closeBlocker()
+	}()
+
+	// Step 3: All(3) should succeed. The remote replies are expected promptly,
+	// and the delayed local reply should arrive once the blocker releases.
+	ctx, cancel = context.WithTimeout(t.Context(), 2*time.Second)
+	responses = gorums.QuorumCall[*pb.StringValue, *pb.StringValue](
+		cfg.Context(ctx),
+		pb.String("all-call"),
+		mock.TestMethod,
+	)
+	result, err = responses.All()
+	cancel()
+	if err != nil {
+		t.Fatalf("All: %v", err)
+	}
+	if result.GetValue() != "echo: all-call" {
+		t.Errorf("All: got %q, want %q", result.GetValue(), "echo: all-call")
+	}
 }

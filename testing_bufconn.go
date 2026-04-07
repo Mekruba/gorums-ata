@@ -116,33 +116,21 @@ func testSetupServers(t testing.TB, numServers int, srvFn func(int) ServerIface)
 	return setupServers(t, numServers, srvFn, listenFn)
 }
 
-// getOrCreateManager returns the existing manager or creates a new one with bufconn dialing.
-// If a new manager is created, its cleanup is registered via t.Cleanup.
-func (to *testOptions) getOrCreateManager(t testing.TB) *Manager {
-	if to.existingMgr != nil {
-		// Don't register cleanup - caller is responsible for closing the manager
-		return to.existingMgr
-	}
-
-	// Create an indirect dialer that looks up from the registry at dial time.
-	// This allows the manager to dial addresses that are registered after manager creation.
-	bufconnDialer := func(ctx context.Context, addr string) (net.Conn, error) {
-		dialer, err := globalBufconnRegistry.getDialer(t)
+// TestDialOptions returns a [DialOption] that configures a bufconn-based in-memory
+// dialer for tests. The dialer looks up the registered listener at dial time, so
+// tests may register listeners after calling TestDialOptions.
+func TestDialOptions(t testing.TB) DialOption {
+	dialer := func(ctx context.Context, addr string) (net.Conn, error) {
+		d, err := globalBufconnRegistry.getDialer(t)
 		if err != nil {
 			return nil, err
 		}
-		return dialer(ctx, addr)
+		return d(ctx, addr)
 	}
-
-	// Create manager with bufconn dialer and register its cleanup LAST so it runs FIRST (LIFO)
-	dialOpts := []grpc.DialOption{
-		grpc.WithContextDialer(bufconnDialer),
+	return WithDialOptions(
+		grpc.WithContextDialer(dialer),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	}
-	mgrOpts := append([]ManagerOption{WithDialOptions(dialOpts...)}, to.managerOpts...)
-	mgr := NewManager(mgrOpts...)
-	t.Cleanup(func() { Closer(t, mgr)() })
-	return mgr
+	)
 }
 
 // bufconnListener wraps bufconn.Listener to implement net.Listener

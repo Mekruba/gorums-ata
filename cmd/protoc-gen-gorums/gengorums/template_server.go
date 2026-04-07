@@ -12,11 +12,11 @@ var serverInterface = `
 type {{$service}}Server interface {
 	{{- range .Methods}}
 	{{- if isOneway .}}
-	{{.GoName}}(ctx {{$context}}, request *{{in $genFile .}})
+	{{.GoName}}({{$context}}, *{{in $genFile .}})
 	{{- else if isStreamingServer .}}
-	{{.GoName}}(ctx {{$context}}, request *{{in $genFile .}}, send func(response *{{out $genFile .}}) error) error
+	{{.GoName}}({{$context}}, *{{in $genFile .}}, func(*{{out $genFile .}}))
 	{{- else}}
-	{{.GoName}}(ctx {{$context}}, request *{{in $genFile .}}) (response *{{out $genFile .}}, err error)
+	{{.GoName}}({{$context}}, *{{in $genFile .}}) (*{{out $genFile .}}, error)
 	{{- end}}
 	{{- end}}
 }
@@ -38,11 +38,11 @@ func Register{{$service}}Server(srv *{{use "gorums.Server" $genFile}}, impl {{$s
 		impl.{{.GoName}}(ctx, req)
 		return nil, nil
 		{{- else if isStreamingServer .}}
-		err := impl.{{.GoName}}(ctx, req, func(resp *{{out $genFile .}}) error {
+		impl.{{.GoName}}(ctx, req, func(resp *{{out $genFile .}}) {
 			out := {{$newMessage}}(in, resp)
-			return ctx.SendMessage(out)
+			ctx.SendMessage(out)
 		})
-		return nil, err
+		return nil, nil
 		{{- else }}
 		resp, err := impl.{{.GoName}}(ctx, req)
 		if err != nil {

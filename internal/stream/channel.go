@@ -33,6 +33,30 @@ type Request struct {
 	SendTime     time.Time
 }
 
+// deliver sends the response on request's response channel, preferring delivery
+// even if request's context is already canceled. If the channel is full,
+// it falls back to respecting context cancellation to avoid blocking forever.
+func (r Request) deliver(resp response) bool {
+	select {
+	case r.ResponseChan <- resp:
+		return true
+	default:
+	}
+	select {
+	case r.ResponseChan <- resp:
+		return true
+	case <-r.Ctx.Done():
+		return false
+	}
+}
+
+// replyError sends err to the request's response channel if one is set.
+func (r Request) replyError(nodeID uint32, err error) {
+	if r.ResponseChan != nil {
+		r.deliver(response{NodeID: nodeID, Err: err})
+	}
+}
+
 type Channel struct {
 	sendQ chan Request
 	id    uint32
@@ -133,10 +157,31 @@ func newChannel(parentCtx context.Context, id uint32, sendBufferSize uint, conn 
 	return c
 }
 
+// NewLocalChannel creates a Channel that dispatches requests in-process,
+// bypassing the network entirely. The provided router must carry the
+// RequestHandler used to serve incoming call types on this node.
+// No goroutines are started; the channel's Close is a no-op.
+func NewLocalChannel(id uint32, router *MessageRouter) *Channel {
+	c := &Channel{
+		id:     id,
+		router: router,
+	}
+	c.closeOnceFunc = sync.OnceValue(func() error { return nil })
+	return c
+}
+
+// isLocal returns true if this channel dispatches in-process rather than over a
+// network connection.
+func (c *Channel) isLocal() bool {
+	// The nil sendQ is the discriminator: all outbound and inbound channels always
+	// allocate a sendQ via make(chan Request, ...) in newChannel.
+	return c.sendQ == nil
+}
+
 // IsInbound returns true if this channel was created from a server-side stream
 // rather than an outbound client connection.
 func (c *Channel) IsInbound() bool {
-	return c.conn == nil
+	return c.conn == nil && c.sendQ != nil
 }
 
 // NewChannelWithState creates a new Channel with a specific state for testing.
@@ -204,18 +249,20 @@ func (c *Channel) getStream() BidiStream {
 // the receiver calls clearStream on a stale stream after ensureStream has already
 // replaced it with a new one, which would otherwise cancel the new stream's context
 // and spuriously cancel requests that belong to the new stream.
+// It returns true if stale was still current and was cleared, false otherwise.
 // This triggers reconnection on the next send attempt.
-func (c *Channel) clearStream(stale BidiStream) {
+func (c *Channel) clearStream(stale BidiStream) bool {
 	c.streamMut.Lock()
 	defer c.streamMut.Unlock()
 	if c.stream != stale {
 		// stale is already gone; a new stream has been established — do not cancel it
-		return
+		return false
 	}
 	if c.streamCancel != nil {
 		c.streamCancel()
 	}
 	c.stream = nil
+	return true
 }
 
 // isConnected returns true if the channel has an active stream.
@@ -229,6 +276,9 @@ func (c *Channel) isConnected() bool {
 }
 
 // Enqueue adds the request to the send queue.
+//
+// If it is a local channel, the request is dispatched in-process via
+// the registered RequestHandler without touching the network.
 // If the node is closed, it responds with an error instead.
 //
 // WaitSendDone and Streaming are mutually exclusive: WaitSendDone is for one-way
@@ -237,7 +287,11 @@ func (c *Channel) isConnected() bool {
 // Combining them would cause double delivery on the response channel.
 func (c *Channel) Enqueue(req Request) {
 	if req.WaitSendDone && req.Streaming {
-		panic("stream: WaitSendDone and Streaming are mutually exclusive")
+		panic("gorums: WaitSendDone and Streaming are mutually exclusive")
+	}
+	if c.isLocal() {
+		c.router.DispatchLocalRequest(c.id, req)
+		return
 	}
 	// Two-stage select: the outer non-blocking check catches the already-closed
 	// case deterministically. Go's select only falls through to default when no
@@ -251,12 +305,12 @@ func (c *Channel) Enqueue(req Request) {
 	select {
 	case <-c.connCtx.Done():
 		// the node's close() method was called: respond with error instead of enqueueing
-		c.replyError(req, ErrNodeClosed)
+		req.replyError(c.id, ErrNodeClosed)
 	default:
 		select {
 		case <-c.connCtx.Done():
 			// the node's close() method was called: respond with error instead of enqueueing
-			c.replyError(req, ErrNodeClosed)
+			req.replyError(c.id, ErrNodeClosed)
 		case c.sendQ <- req:
 			// enqueued successfully
 		}
@@ -267,7 +321,7 @@ func (c *Channel) Enqueue(req Request) {
 // This is called during node shutdown to notify all waiting calls.
 func (c *Channel) cancelPendingMsgs(err error) {
 	for _, req := range c.router.CancelPending() {
-		c.replyError(req, err)
+		req.replyError(c.id, err)
 	}
 }
 
@@ -276,20 +330,24 @@ func (c *Channel) cancelPendingMsgs(err error) {
 // with ErrStreamDown because they cannot be safely retried.
 func (c *Channel) requeuePendingMsgs() {
 	requeue, cancel := c.router.RequeuePending()
-	for _, req := range requeue {
-		c.Enqueue(req)
-	}
 	for _, req := range cancel {
-		c.replyError(req, ErrStreamDown)
+		req.replyError(c.id, ErrStreamDown)
 	}
-}
-
-// replyError sends err to the request's response channel if one is set.
-// This is used for requests that have not yet been registered in responseRouters
-// and therefore cannot be reached via routeResponse.
-func (c *Channel) replyError(req Request, err error) {
-	if req.ResponseChan != nil {
-		req.ResponseChan <- response{NodeID: c.id, Err: err}
+	// The requeue is performed in a separate goroutine because this method is called
+	// from sender(), which is the sole reader of sendQ. Calling Enqueue directly from
+	// the sender would deadlock: Enqueue writes to the unbuffered sendQ, but no one
+	// is reading it because the sender itself is blocked in the Enqueue call.
+	// The goroutine writes to sendQ while the sender returns to its read loop.
+	//
+	// If connCtx is cancelled before the goroutine finishes, each Enqueue call will
+	// take the connCtx.Done() branch and replyError with ErrNodeClosed, and
+	// drainSendQ (deferred in sender) will drain any items that made it to sendQ.
+	if len(requeue) > 0 {
+		go func() {
+			for _, req := range requeue {
+				c.Enqueue(req)
+			}
+		}()
 	}
 }
 
@@ -303,7 +361,7 @@ func (c *Channel) drainSendQ() {
 	for {
 		select {
 		case req := <-c.sendQ:
-			c.replyError(req, ErrNodeClosed)
+			req.replyError(c.id, ErrNodeClosed)
 		default:
 			// sendQ is empty
 			return
@@ -339,16 +397,16 @@ func (c *Channel) sender() {
 		}
 
 		if err := c.ensureStream(); err != nil {
-			c.replyError(req, err)
+			req.replyError(c.id, err)
 			continue
 		}
 		if req.Ctx.Err() != nil {
-			c.replyError(req, req.Ctx.Err())
+			req.replyError(c.id, req.Ctx.Err())
 			continue
 		}
 		stream := c.getStream()
 		if stream == nil {
-			c.replyError(req, ErrStreamDown)
+			req.replyError(c.id, ErrStreamDown)
 			continue
 		}
 
@@ -360,11 +418,16 @@ func (c *Channel) sender() {
 
 		// Watch for per-request cancellation while Send is in-flight.
 		// If req.Ctx is done before Send returns, clearStream unblocks
-		// the blocked Send by cancelling the stream context.
-		// stop() disarms the watcher after Send returns, preventing a
-		// spurious clearStream on a still-valid stream.
+		// the blocked Send by cancelling the stream context and the
+		// goroutine that wins the clear is also responsible for
+		// requeueing/canceling pending requests.
+		//
+		// stop() is advisory only: it may return false if the callback
+		// already started around the same time Send returned.
 		stop := context.AfterFunc(req.Ctx, func() {
-			c.clearStream(stream)
+			if c.clearStream(stream) {
+				c.requeuePendingMsgs()
+			}
 		})
 		if err := stream.Send(req.Msg); err != nil {
 			stop()
@@ -403,36 +466,23 @@ func (c *Channel) receiver() {
 		msg, e := stream.Recv()
 		if e != nil {
 			c.setLastErr(e)
-			c.clearStream(stream)
-			c.requeuePendingMsgs()
+			// A stale receiver may observe an error after a newer stream has already
+			// replaced this one. Only the goroutine that actually clears the current
+			// stream may requeue pending requests.
+			if c.clearStream(stream) {
+				c.requeuePendingMsgs()
+			}
 			// Check for shutdown before attempting reconnection
 			if c.connCtx.Err() != nil {
 				// the node's close() method was called: exit receiver goroutine
 				return
 			}
 		} else {
-			err := msg.ErrorStatus()
-			// Two-way calls (RPCCall/QuorumCall) deliver server response.
-			if c.router.RouteResponse(msg.GetMessageSeqNo(), response{NodeID: c.id, Value: msg, Err: err}) {
-				continue
-			}
-			// Server-initiated request — dispatch via registered handler.
-			if rh, ok := c.router.RequestHandler(); ok {
-				go c.dispatchRequest(rh, msg)
-			}
+			// Route to a pending call or dispatch server-initiated back-channel
+			// requests. Stale (cancelled) calls are silently dropped.
+			c.router.RouteMessage(c.connCtx, c.id, msg, c.Enqueue)
 		}
 	}
-}
-
-// dispatchRequest handles a server-initiated request on the client side.
-// It uses the RequestHandler to process the request and enqueues the response
-// back through this channel.
-func (c *Channel) dispatchRequest(rh RequestHandler, reqMsg *Message) {
-	send := func(msg *Message) {
-		c.Enqueue(Request{Ctx: c.connCtx, Msg: msg})
-	}
-	// We pass an empty release function since there is no server-side mutex on the client side.
-	rh.HandleRequest(c.connCtx, reqMsg, func() {}, send)
 }
 
 func (c *Channel) setLastErr(err error) {

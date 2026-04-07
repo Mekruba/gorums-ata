@@ -1,9 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"sync"
@@ -11,53 +12,34 @@ import (
 	"time"
 
 	"github.com/relab/gorums"
-	"github.com/relab/gorums/examples/interceptors"
 	pb "github.com/relab/gorums/examples/storage/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-func startServer(address string) (*gorums.Server, string) {
-	// listen on given address
-	lis, err := net.Listen("tcp", address)
+func runServer(address string, opts ...gorums.Option) {
+	sys, err := gorums.NewSystem(address, opts...)
 	if err != nil {
-		log.Fatalf("Failed to listen on '%s': %v\n", address, err)
+		log.Fatalf("Failed to create system on '%s': %v", address, err)
 	}
-	// init server implementation
-	storage := newStorageServer()
-	storage.logger = log.New(os.Stderr, fmt.Sprintf("%s: ", lis.Addr()), log.Ltime|log.Lmicroseconds|log.Lmsgprefix)
+	storage := newStorageServer(os.Stderr, sys.Addr())
+	sys.RegisterService(nil, func(srv *gorums.Server) {
+		pb.RegisterStorageServer(srv, storage)
+	})
 
-	// create Gorums server
-	srv := gorums.NewServer(gorums.WithInterceptors(
-		interceptors.LoggingInterceptor("abc"),
-		interceptors.LoggingSimpleInterceptor,
-		interceptors.NoFooAllowedInterceptor[*pb.WriteRequest],
-		interceptors.MetadataInterceptor,
-	))
-	// register server implementation with Gorums server
-	pb.RegisterStorageServer(srv, storage)
-	// handle requests on listener
-	go func() {
-		err := srv.Serve(lis)
-		if err != nil {
-			storage.logger.Fatalf("Server error: %v\n", err)
-		}
-	}()
-
-	return srv, lis.Addr().String()
-}
-
-func runServer(address string) {
 	// catch signals in order to shut down gracefully
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	srv, addr := startServer(address)
+	go func() {
+		if err := sys.Serve(); err != nil {
+			log.Printf("Server error: %v", err)
+		}
+	}()
 
-	log.Printf("Started storage server on %s\n", addr)
+	log.Printf("Started storage server on %s\n", sys.Addr())
 
 	<-signals
-	// shutdown Gorums server
-	srv.Stop()
+	_ = sys.Stop()
 }
 
 type state struct {
@@ -72,10 +54,36 @@ type storageServer struct {
 	logger  *log.Logger
 }
 
-func newStorageServer() *storageServer {
+func newStorageServer(out io.Writer, label string) *storageServer {
 	return &storageServer{
 		storage: make(map[string]state),
+		logger:  log.New(rawWriter{out}, label+": ", 0),
 	}
+}
+
+// rawWriter wraps a writer and replaces lone \n with \r\n,
+// so that log output renders correctly in raw terminal mode.
+type rawWriter struct {
+	w io.Writer
+}
+
+func (rw rawWriter) Write(p []byte) (n int, err error) {
+	replaced := bytes.ReplaceAll(p, []byte("\n"), []byte("\r\n"))
+	wn, err := rw.w.Write(replaced)
+
+	// Treat a short write to the underlying writer as an error
+	if err == nil && wn < len(replaced) {
+		err = io.ErrShortWrite
+	}
+
+	// If an error occurred, conservatively report 0 bytes written to
+	// prevent the caller from assuming data was fully processed.
+	if err != nil {
+		return 0, err
+	}
+
+	// Success: satisfy the io.Writer contract by returning the original length
+	return len(p), nil
 }
 
 // ReadRPC is an RPC handler
@@ -88,21 +96,68 @@ func (s *storageServer) WriteRPC(_ gorums.ServerCtx, req *pb.WriteRequest) (resp
 	return s.Write(req)
 }
 
-// ReadQC is an RPC handler for a quorum call
-func (s *storageServer) ReadQC(_ gorums.ServerCtx, req *pb.ReadRequest) (resp *pb.ReadResponse, err error) {
-	return s.Read(req)
+// WriteUnicast is an RPC handler for one-way unicast writes.
+func (s *storageServer) WriteUnicast(_ gorums.ServerCtx, req *pb.WriteRequest) {
+	if _, err := s.Write(req); err != nil {
+		s.logger.Printf("WriteUnicast error: %v", err)
+	}
 }
 
-// WriteQC is an RPC handler for a quorum call
-func (s *storageServer) WriteQC(_ gorums.ServerCtx, req *pb.WriteRequest) (resp *pb.WriteResponse, err error) {
-	return s.Write(req)
-}
-
+// WriteMulticast is an RPC handler for one-way multicast writes.
 func (s *storageServer) WriteMulticast(_ gorums.ServerCtx, req *pb.WriteRequest) {
 	_, err := s.Write(req)
 	if err != nil {
 		s.logger.Printf("Write error: %v", err)
 	}
+}
+
+// ReadQC is an RPC handler for a quorum call.
+func (s *storageServer) ReadQC(_ gorums.ServerCtx, req *pb.ReadRequest) (resp *pb.ReadResponse, err error) {
+	return s.Read(req)
+}
+
+// WriteQC is an RPC handler for a quorum call.
+func (s *storageServer) WriteQC(_ gorums.ServerCtx, req *pb.WriteRequest) (resp *pb.WriteResponse, err error) {
+	return s.Write(req)
+}
+
+// ReadCorrectable is an RPC handler for a correctable quorum call. It sends multiple responses.
+func (s *storageServer) ReadCorrectable(_ gorums.ServerCtx, req *pb.ReadRequest, send func(response *pb.ReadResponse)) {
+	resp, err := s.Read(req)
+	if err != nil {
+		s.logger.Printf("ReadCorrectable error: %v", err)
+		return
+	}
+	// Note: in a real application, the server might send multiple updates.
+	// For this storage example, we just send the current state once.
+	send(resp)
+}
+
+// ReadNestedQC is a quorum-call handler that performs a nested quorum call
+// using the server's known-peer configuration from WithConfig.
+func (s *storageServer) ReadNestedQC(ctx gorums.ServerCtx, req *pb.ReadRequest) (resp *pb.ReadResponse, err error) {
+	cfg := ctx.Config()
+	if len(cfg) == 0 {
+		return nil, fmt.Errorf("read_nested_qc: requires server peer configuration")
+	}
+	// Release before nested outbound calls to avoid blocking inbound recv processing.
+	ctx.Release()
+	return newestValue(pb.ReadQC(cfg.Context(ctx), req))
+}
+
+// WriteNestedMulticast is a quorum-call handler that performs a nested multicast
+// using the server's known-peer configuration from WithConfig.
+func (s *storageServer) WriteNestedMulticast(ctx gorums.ServerCtx, req *pb.WriteRequest) (resp *pb.WriteResponse, err error) {
+	cfg := ctx.Config()
+	if len(cfg) == 0 {
+		return nil, fmt.Errorf("write_nested_multicast: requires server peer configuration")
+	}
+	// Release before nested outbound calls to avoid blocking inbound recv processing.
+	ctx.Release()
+	if err := pb.WriteMulticast(cfg.Context(ctx), req); err != nil {
+		return nil, fmt.Errorf("write_nested_multicast: %w", err)
+	}
+	return pb.WriteResponse_builder{New: true}.Build(), nil
 }
 
 // Read reads a value from storage

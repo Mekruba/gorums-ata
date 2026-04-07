@@ -20,6 +20,18 @@ service Storage {
   // returns true if the value was updated.
   rpc WriteRPC(WriteRequest) returns (WriteResponse) {}
 
+  // WriteUnicast executes a one-way Write unicast call on a single node.
+  // It does not wait for a response.
+  rpc WriteUnicast(WriteRequest) returns (google.protobuf.Empty) {
+    option (gorums.unicast) = true;
+  }
+
+  // WriteMulticast executes a Write multicast call on a configuration of nodes.
+  // It does not wait for any responses.
+  rpc WriteMulticast(WriteRequest) returns (google.protobuf.Empty) {
+    option (gorums.multicast) = true;
+  }
+
   // ReadQC executes a Read quorum call on a configuration of nodes and
   // returns the most recent value.
   rpc ReadQC(ReadRequest) returns (ReadResponse) {
@@ -32,12 +44,25 @@ service Storage {
     option (gorums.quorumcall) = true;
   }
 
-  // WriteMulticast executes a Write multicast call on a configuration of nodes.
-  // It does not wait for any responses.
-  rpc WriteMulticast(WriteRequest) returns (google.protobuf.Empty) {
-    option (gorums.multicast) = true;
+  // ReadNestedQC executes a quorum call where each server handler performs
+  // a nested quorum call using ServerCtx.Config().
+  rpc ReadNestedQC(ReadRequest) returns (ReadResponse) {
+    option (gorums.quorumcall) = true;
+  }
+
+  // WriteNestedMulticast executes a quorum call where each server handler
+  // performs a nested multicast using ServerCtx.Config().
+  rpc WriteNestedMulticast(WriteRequest) returns (WriteResponse) {
+    option (gorums.quorumcall) = true;
+  }
+
+  // ReadCorrectable executes a quorum call that supports correctable responses.
+  // It returns a stream of ReadResponse as multiple nodes respond or updates occur.
+  rpc ReadCorrectable(ReadRequest) returns (stream ReadResponse) {
+    option (gorums.quorumcall) = true;
   }
 }
+
 
 // ReadRequest is the request message for Read RPCs and Read quorum calls.
 message ReadRequest {

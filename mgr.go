@@ -11,25 +11,24 @@ import (
 	"google.golang.org/grpc/backoff"
 )
 
-// Manager maintains a connection pool of nodes on
+// outboundManager maintains a connection pool of nodes on
 // which quorum calls can be performed.
-type Manager struct {
+type outboundManager struct {
 	mu        sync.Mutex
 	nodes     []*Node
 	lookup    map[uint32]*Node
 	closeOnce sync.Once
 	logger    *log.Logger
-	opts      managerOptions
+	opts      dialOptions
 	nextMsgID uint64
 }
 
-// NewManager returns a new Manager for managing connection to nodes added
-// to the manager. This function accepts manager options used to configure
-// various aspects of the manager.
-func NewManager(opts ...ManagerOption) *Manager {
-	m := &Manager{
+// newOutboundManager returns a new outboundManager for managing connection to
+// nodes added to the manager.
+func newOutboundManager(opts ...DialOption) *outboundManager {
+	m := &outboundManager{
 		lookup: make(map[uint32]*Node),
-		opts:   newManagerOptions(),
+		opts:   newDialOptions(),
 	}
 	for _, opt := range opts {
 		opt(&m.opts)
@@ -49,7 +48,7 @@ func NewManager(opts ...ManagerOption) *Manager {
 }
 
 // Close closes all node connections and any client streams.
-func (m *Manager) Close() error {
+func (m *outboundManager) Close() error {
 	var err error
 	m.closeOnce.Do(func() {
 		for _, node := range m.nodes {
@@ -59,20 +58,8 @@ func (m *Manager) Close() error {
 	return err
 }
 
-// NodeIDs returns the identifier of each available node. IDs are returned in
-// the same order as they were provided in the creation of the Manager.
-func (m *Manager) NodeIDs() []uint32 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	ids := make([]uint32, 0, len(m.nodes))
-	for _, node := range m.nodes {
-		ids = append(ids, node.ID())
-	}
-	return ids
-}
-
 // Node returns the node with the given identifier if present.
-func (m *Manager) Node(id uint32) (node *Node, found bool) {
+func (m *outboundManager) Node(id uint32) (node *Node, found bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	node, found = m.lookup[id]
@@ -81,41 +68,40 @@ func (m *Manager) Node(id uint32) (node *Node, found bool) {
 
 // Nodes returns a slice of each available node. IDs are returned in the same
 // order as they were provided in the creation of the Manager.
-func (m *Manager) Nodes() []*Node {
+func (m *outboundManager) Nodes() []*Node {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.nodes
 }
 
-// Size returns the number of nodes in the Manager.
-func (m *Manager) Size() (nodes int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.nodes)
-}
-
-func (m *Manager) addNode(node *Node) {
+func (m *outboundManager) addNode(node *Node) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lookup[node.id] = node
 	m.nodes = append(m.nodes, node)
 }
 
-func (m *Manager) newNode(id uint32, addr string) (*Node, error) {
+func (m *outboundManager) newNode(id uint32, addr string) (*Node, error) {
 	if _, found := m.Node(id); found {
-		return nil, fmt.Errorf("node %d already exists", id)
+		return nil, fmt.Errorf("gorums: node %d already exists", id)
+	}
+	// Use a local (in-process) node when this ID is our own local node
+	// and a handler is configured (symmetric peer configuration).
+	if id == m.opts.localNodeID && m.opts.handler != nil {
+		n := newLocalNode(id, addr, m.getMsgID, m.opts.handler, m)
+		m.addNode(n)
+		return n, nil
 	}
 	opts := nodeOptions{
 		ID:             id,
 		SendBufferSize: m.opts.sendBuffer,
 		MsgIDGen:       m.getMsgID,
 		Metadata:       m.opts.metadata,
-		PerNodeMD:      m.opts.perNodeMD,
 		DialOpts:       m.opts.grpcDialOpts,
-		RequestHandler: m.opts.requestHandlerFor(id),
+		RequestHandler: m.opts.handler,
 		Manager:        m,
 	}
-	n, err := newNode(addr, opts)
+	n, err := newOutboundNode(addr, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -126,6 +112,9 @@ func (m *Manager) newNode(id uint32, addr string) (*Node, error) {
 // getMsgID returns a unique message ID for a new RPC from this client's manager.
 // Client-initiated IDs never have the high bit set in practice: reaching 2^63
 // requires approximately 292,000 years at one million calls per second.
-func (m *Manager) getMsgID() uint64 {
+func (m *outboundManager) getMsgID() uint64 {
 	return atomic.AddUint64(&m.nextMsgID, 1)
 }
+
+// compile-time assertion for interface compliance.
+var _ nodeRegistry = (*outboundManager)(nil)

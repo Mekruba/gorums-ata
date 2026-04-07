@@ -17,6 +17,12 @@ type Message struct {
 	*stream.Message
 }
 
+// MetadataEntry is a type alias for [stream.MetadataEntry].
+type MetadataEntry = stream.MetadataEntry
+
+// MetadataEntry_builder is a type alias for [stream.MetadataEntry_builder].
+type MetadataEntry_builder = stream.MetadataEntry_builder
+
 type (
 	// Handler processes a request and returns a response.
 	Handler func(ServerCtx, *Message) (*Message, error)
@@ -45,24 +51,25 @@ func (ctx *ServerCtx) Release() {
 	}
 }
 
-// SendMessage attempts to send the given message to the client.
-// This may fail if the stream was closed or the stream context got canceled.
+// SendMessage sends the given message to the client.
+// If marshaling fails, the error is encoded into the response envelope
+// and sent to the client; the stream is not closed.
 //
 // This function should only be used by generated code.
-func (ctx *ServerCtx) SendMessage(out *Message) error {
+func (ctx *ServerCtx) SendMessage(out *Message) {
 	// If Msg is set, marshal it to payload before sending.
 	if out.Msg != nil && len(out.GetPayload()) == 0 {
 		payload, err := proto.Marshal(out.Msg)
 		if err == nil {
 			out.SetPayload(payload)
+		} else {
+			// Encode the marshal error into the response envelope; don't close the stream.
+			out = MessageWithError(nil, out, err)
 		}
-		// Return an error to the client if marshaling failed on the server side; don't close the stream.
-		out = MessageWithError(nil, out, err)
 	}
 	if ctx.send != nil {
 		ctx.send(out.Message)
 	}
-	return nil
 }
 
 // Config returns a [Configuration] representing the cluster nodes.
@@ -83,10 +90,11 @@ func (ctx *ServerCtx) Config() Configuration {
 	return ctx.srv.Config()
 }
 
-// ClientConfig returns a [Configuration] of all connected client peers.
+// ClientConfig returns a [Configuration] of all connected clients capable of
+// receiving reverse-direction calls from the server.
+// An empty (non-nil) Configuration is returned if no client peers are connected.
 // The returned slice is replaced atomically on each connect/disconnect;
-// retaining a reference to an old value is safe.
-// Returns nil if no peer tracking is configured.
+// thus, retaining a reference to an old configuration is safe.
 func (ctx *ServerCtx) ClientConfig() Configuration {
 	if ctx.srv == nil {
 		return nil
@@ -95,8 +103,7 @@ func (ctx *ServerCtx) ClientConfig() Configuration {
 }
 
 // ConfigContext returns a [ConfigContext] encapsulating the [Configuration] of
-// all connected known peers, plus this node.
-// Returns nil if no peer tracking is configured.
+// all connected known peer servers, including this node.
 func (ctx *ServerCtx) ConfigContext() *ConfigContext {
 	if ctx.srv == nil {
 		return nil
@@ -108,8 +115,7 @@ func (ctx *ServerCtx) ConfigContext() *ConfigContext {
 }
 
 // ClientConfigContext returns a [ConfigContext] encapsulating the [Configuration] of
-// all connected client peers.
-// Returns nil if no peer tracking is configured or if no clients are connected.
+// all connected clients capable of receiving reverse-direction calls from the server.
 func (ctx *ServerCtx) ClientConfigContext() *ConfigContext {
 	if ctx.srv == nil {
 		return nil

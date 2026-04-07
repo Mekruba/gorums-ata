@@ -48,7 +48,7 @@ type Node struct {
 	// Only assigned at creation.
 	id   uint32
 	addr string
-	mgr  *Manager // only used for backward compatibility to allow Configuration.Manager()
+	mgr  *outboundManager // owning manager for this node
 
 	msgIDGen func() uint64
 	router   *stream.MessageRouter
@@ -64,7 +64,7 @@ type Node struct {
 //	resp, err := service.GRPCCall(nodeCtx, req)
 func (n *Node) Context(parent context.Context) *NodeContext {
 	if n == nil {
-		panic("gorums: Context called with nil node")
+		panic("gorums: Context called on nil node")
 	}
 	return &NodeContext{Context: parent, node: n}
 }
@@ -75,15 +75,14 @@ type nodeOptions struct {
 	SendBufferSize uint
 	MsgIDGen       func() uint64
 	Metadata       metadata.MD
-	PerNodeMD      func(uint32) metadata.MD
 	DialOpts       []grpc.DialOption
 	RequestHandler stream.RequestHandler
-	Manager        *Manager // only used for backward compatibility to allow Configuration.Manager()
+	Manager        *outboundManager // owning manager
 }
 
-// newNode creates a new node using the provided options. It establishes
+// newOutboundNode creates a new node using the provided options. It establishes
 // the connection (lazy dial) and initializes the outbound channel.
-func newNode(addr string, opts nodeOptions) (*Node, error) {
+func newOutboundNode(addr string, opts nodeOptions) (*Node, error) {
 	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -105,9 +104,6 @@ func newNode(addr string, opts nodeOptions) (*Node, error) {
 
 	// Create outgoing context with metadata for this node's stream.
 	md := opts.Metadata.Copy()
-	if opts.PerNodeMD != nil {
-		md = metadata.Join(md, opts.PerNodeMD(n.id))
-	}
 	ctx := metadata.NewOutgoingContext(context.Background(), md)
 
 	// Create new outbound channel and establish gRPC node stream
@@ -115,58 +111,83 @@ func newNode(addr string, opts nodeOptions) (*Node, error) {
 	return n, nil
 }
 
-// newPeerNode creates a Node for a known peer or self without an active
-// channel. Used by InboundManager at construction time for all configured
+// newInboundNode creates a Node for a known peer or self without an active
+// channel. Used by inboundManager at construction time for all configured
 // peers; the channel is attached when the peer's stream arrives.
-func newPeerNode(id uint32, addr string, msgIDGen func() uint64) *Node {
+// The handler, if non-nil, is stored in the router and used to dispatch
+// client-initiated requests received on the inbound stream.
+func newInboundNode(id uint32, addr string, msgIDGen func() uint64, handler stream.RequestHandler) *Node {
 	return &Node{
 		id:       id,
 		addr:     addr,
 		msgIDGen: msgIDGen,
-		router:   stream.NewMessageRouter(),
+		router:   stream.NewMessageRouter(handler),
 	}
+}
+
+// newLocalNode creates a Node that dispatches calls in-process, bypassing the
+// network. It is used for the self-node when this process is both client and
+// server in a symmetric peer configuration. The provided handler (typically
+// the local *Server) serves requests directly without a gRPC round-trip.
+func newLocalNode(id uint32, addr string, msgIDGen func() uint64, handler stream.RequestHandler, mgr *outboundManager) *Node {
+	router := stream.NewMessageRouter(handler)
+	n := &Node{
+		id:       id,
+		addr:     addr,
+		mgr:      mgr,
+		msgIDGen: msgIDGen,
+		router:   router,
+	}
+	n.channel.Store(stream.NewLocalChannel(id, router))
+	return n
+}
+
+// IsInbound returns true if the node has an active inbound channel.
+func (n *Node) IsInbound() bool {
+	if n == nil {
+		return false
+	}
+	ch := n.channel.Load()
+	return ch != nil && ch.IsInbound()
 }
 
 // attachStream attaches a new inbound channel to the node when a peer connects.
 // If the node already has an active channel (e.g., a stale stream from a previous
 // connection), it is atomically replaced and the old channel is closed.
-func (n *Node) attachStream(streamCtx context.Context, inboundStream stream.BidiStream, sendBufferSize uint) {
+// The returned detach function closes and removes the channel, but only if it
+// is still the active one. This prevents stale cleanup from an older stream
+// from detaching a replacement channel that has already taken over.
+func (n *Node) attachStream(streamCtx context.Context, inboundStream stream.BidiStream, sendBufferSize uint) (detach func() bool) {
 	newCh := stream.NewInboundChannel(streamCtx, n.id, sendBufferSize, inboundStream, n.router)
 	if old := n.channel.Swap(newCh); old != nil {
 		old.Close()
 	}
-}
-
-// detachStream closes and removes the node's inbound channel when the peer disconnects.
-func (n *Node) detachStream() {
-	if ch := n.channel.Swap(nil); ch != nil {
-		ch.Close()
+	return func() bool {
+		if n.channel.CompareAndSwap(newCh, nil) {
+			newCh.Close()
+			return true
+		}
+		return false
 	}
 }
 
-// RouteResponse routes an incoming message as a response to a pending
-// server-initiated call. Returns true if the message matched a pending
-// call and was handled; false if it should be dispatched as a new request.
+// RouteInbound delivers a response to a pending call or dispatches a
+// client-initiated request to the registered handler. The release
+// function is always called.
 // This implements the [stream.PeerNode] interface.
-func (n *Node) RouteResponse(msg *stream.Message) bool {
-	return n.router.RouteResponse(msg.GetMessageSeqNo(), NodeResponse[*stream.Message]{
-		NodeID: n.id,
-		Value:  msg,
-		Err:    msg.ErrorStatus(),
-	})
+func (n *Node) RouteInbound(ctx context.Context, msg *stream.Message, release func(), send func(*stream.Message)) {
+	n.router.RouteInboundMessage(ctx, n.id, msg, release, send)
 }
 
-// Enqueue enqueues a request to this node's channel. If the channel is nil,
-// e.g., for the self-node, the request is silently dropped.
+// Enqueue enqueues a request to this node's channel.
+// For local channels the channel handles in-process dispatch directly.
+// If no channel is available, the request is silently dropped.
 // This implements the [stream.PeerNode] interface.
 func (n *Node) Enqueue(req stream.Request) {
 	if ch := n.channel.Load(); ch != nil {
 		ch.Enqueue(req)
 	}
 }
-
-// compile-time assertion that Node implements the PeerNode interface.
-var _ stream.PeerNode = (*Node)(nil)
 
 // close this node.
 func (n *Node) close() error {
@@ -319,3 +340,6 @@ var LastNodeError = func(n1, n2 *Node) bool {
 	}
 	return true
 }
+
+// compile-time assertion for interface compliance.
+var _ stream.PeerNode = (*Node)(nil)
