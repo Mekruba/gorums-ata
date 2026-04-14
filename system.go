@@ -1,6 +1,7 @@
 package gorums
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,25 +18,24 @@ type System struct {
 }
 
 // NewSystem creates a new Gorums System listening on the specified address.
-// Accepts any mix of [ServerOption], [DialOption], and [NodeListOption].
-// If a [NodeListOption] is provided, an outbound [Configuration] is created
+// Accepts any [DialOption]s. Server options may be passed via [WithServerOptions].
+// If [WithOutboundNodes] is provided, an outbound [Configuration] is created
 // automatically and can be accessed via [System.OutboundConfig].
-// Returns an error if more than one [NodeListOption] is provided.
-func NewSystem(addr string, opts ...Option) (*System, error) {
-	srvOpts, dialOpts, nodeListOpt, err := splitOptions(opts)
-	if err != nil {
-		return nil, err
+func NewSystem(addr string, opts ...DialOption) (*System, error) {
+	dialOpts := newDialOptions()
+	for _, opt := range opts {
+		opt(&dialOpts)
 	}
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 	sys := &System{
-		srv: NewServer(srvOpts...),
+		srv: NewServer(dialOpts.srvOpts...),
 		lis: lis,
 	}
-	if nodeListOpt != nil {
-		cfg, err := sys.newOutboundConfig(nodeListOpt, dialOpts...)
+	if dialOpts.outboundNodes != nil {
+		cfg, err := sys.newOutboundConfig(dialOpts.outboundNodes, opts...)
 		if err != nil {
 			_ = lis.Close()
 			return nil, fmt.Errorf("gorums: failed to create outbound config: %w", err)
@@ -53,7 +53,9 @@ func NewSystem(addr string, opts ...Option) (*System, error) {
 // [Configuration] is created automatically for each system and is available via
 // [System.OutboundConfig].
 //
-// The opts may contain any mix of [ServerOption] and [DialOption], but not [NodeListOption].
+// The opts may contain any [DialOption]s. Server options may be passed via
+// [WithServerOptions]. [WithOutboundNodes] is ignored by this function since
+// the local node list is computed internally.
 //
 // The returned systems are not started. Call [System.Serve] after registering
 // any services. The returned stop function stops all systems and should be
@@ -61,14 +63,10 @@ func NewSystem(addr string, opts ...Option) (*System, error) {
 //
 // If system creation fails, all resources acquired by this function are
 // released before returning the error.
-func NewLocalSystems(n int, opts ...Option) ([]*System, func(), error) {
-	srvOpts, dialOpts, nodeListOpt, err := splitOptions(opts)
-	if err != nil {
-		return nil, nil, err
-	}
-	if nodeListOpt != nil {
-		// NewLocalSystems computes its own node list, so we disallow passing one in.
-		return nil, nil, fmt.Errorf("gorums: unexpected NodeListOption passed to NewLocalSystems")
+func NewLocalSystems(n int, opts ...DialOption) ([]*System, func(), error) {
+	dialOpts := newDialOptions()
+	for _, opt := range opts {
+		opt(&dialOpts)
 	}
 	listeners, nodeList, err := allocateListeners(n)
 	if err != nil {
@@ -77,12 +75,12 @@ func NewLocalSystems(n int, opts ...Option) ([]*System, func(), error) {
 	systems := make([]*System, n)
 	for i := range n {
 		myID := uint32(i + 1)
-		sysSrvOpts := append([]ServerOption{WithConfig(myID, nodeList)}, srvOpts...)
+		sysSrvOpts := append([]ServerOption{WithConfig(myID, nodeList)}, dialOpts.srvOpts...)
 		sys := &System{
 			srv: NewServer(sysSrvOpts...),
 			lis: listeners[i],
 		}
-		cfg, err := sys.newOutboundConfig(nodeList, dialOpts...)
+		cfg, err := sys.newOutboundConfig(nodeList, opts...)
 		if err != nil {
 			for j := range i {
 				_ = systems[j].Stop()
@@ -131,8 +129,8 @@ func (s *System) newOutboundConfig(nodeList NodeListOption, dialOpts ...DialOpti
 }
 
 // OutboundConfig returns the auto-created outbound [Configuration], or nil if none was created.
-// An outbound config is created automatically by [NewLocalSystems] when dial options are provided
-// or peer tracking is enabled, and by [NewSystem] when a [NodeListOption] is provided.
+// An outbound config is created automatically by [NewLocalSystems] and by [NewSystem] when
+// [WithOutboundNodes] is provided.
 func (s *System) OutboundConfig() Configuration {
 	return s.config
 }
@@ -157,6 +155,22 @@ func (s *System) Config() Configuration {
 // thus, retaining a reference to an old configuration is safe.
 func (s *System) ClientConfig() Configuration {
 	return s.srv.ClientConfig()
+}
+
+// WaitForConfig blocks until cond returns true for the current known-peer
+// [Configuration], or until ctx is cancelled or the system is stopped.
+// The condition is checked immediately against the current configuration,
+// so it may return without blocking if the condition is already satisfied.
+func (s *System) WaitForConfig(ctx context.Context, cond func(Configuration) bool) error {
+	return s.srv.waitForKnownConfig(ctx, cond)
+}
+
+// WaitForClientConfig blocks until cond returns true for the current
+// client-peer [Configuration], or until ctx is cancelled or the system is stopped.
+// The condition is checked immediately against the current configuration,
+// so it may return without blocking if the condition is already satisfied.
+func (s *System) WaitForClientConfig(ctx context.Context, cond func(Configuration) bool) error {
+	return s.srv.waitForClientConfig(ctx, cond)
 }
 
 // RegisterService registers the service with the server using the provided register function.
@@ -187,6 +201,8 @@ func (s *System) Serve() error {
 // on the client side will get notified by connection errors.
 // It is safe to call Stop before [System.Serve] to avoid resource leaks.
 func (s *System) Stop() (errs error) {
+	// Unblock any WaitForConfig / WaitForClientConfig callers.
+	s.srv.close()
 	// We cannot use graceful stop here since multicast methods does not
 	// respond to the client, and thus would block indefinitely.
 	s.srv.Stop()

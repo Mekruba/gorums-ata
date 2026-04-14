@@ -145,9 +145,12 @@ func TestSystemSymmetricConfigurationConnectsAllPeers(t *testing.T) {
 
 	// Wait for connections to establish
 	for i, sys := range systems {
-		gorums.WaitForConfigCondition(t, sys.Config, func(cfg gorums.Configuration) bool {
+		ctx := gorums.TestContext(t, 5*time.Second)
+		if err := sys.WaitForConfig(ctx, func(cfg gorums.Configuration) bool {
 			return cfg.Size() == len(systems)
-		})
+		}); err != nil {
+			t.Fatalf("system %d: WaitForConfig: %v", i+1, err)
+		}
 		if got := sys.Config().Size(); got != len(systems) {
 			t.Fatalf("system %d config size: %d, expected: %d", i+1, got, len(systems))
 		}
@@ -172,18 +175,24 @@ func waitWithTimeout(t *testing.T, wg *sync.WaitGroup) {
 func awaitSystemReady(t *testing.T, systems []*gorums.System) {
 	t.Helper()
 	for _, sys := range systems {
-		gorums.WaitForConfigCondition(t, sys.Config, func(cfg gorums.Configuration) bool {
+		ctx := gorums.TestContext(t, 5*time.Second)
+		if err := sys.WaitForConfig(ctx, func(cfg gorums.Configuration) bool {
 			return cfg.Size() == len(systems)
-		})
+		}); err != nil {
+			t.Fatalf("awaitSystemReady: %v", err)
+		}
 	}
 }
 
 // awaitClientReady waits until the server's ClientConfig contains n connected peers.
 func awaitClientReady(t *testing.T, sys *gorums.System, n int) {
 	t.Helper()
-	gorums.WaitForConfigCondition(t, sys.ClientConfig, func(cfg gorums.Configuration) bool {
+	ctx := gorums.TestContext(t, 5*time.Second)
+	if err := sys.WaitForClientConfig(ctx, func(cfg gorums.Configuration) bool {
 		return cfg.Size() == n
-	})
+	}); err != nil {
+		t.Fatalf("awaitClientReady: %v", err)
+	}
 }
 
 // createClientServerSystems creates a server system and a client for back-channel testing.
@@ -428,19 +437,19 @@ func TestSystemHandlerCanMulticastViaConfig(t *testing.T) {
 func TestSystemHandlerCanChainQuorumCallViaConfig(t *testing.T) {
 	type respType = *gorums.Responses[*pb.StringValue]
 
-	// seqAll drains the Seq iterator to exhaustion and returns the last value.
-	// This is the regression path for the self-node dispatch bug where .Seq()
+	// seqAll drains the Results iterator to exhaustion and returns the last value.
+	// This is the regression path for the self-node dispatch bug where .Results()
 	// and .All() would time out when self was included in the quorum.
 	seqAll := func(r respType) (*pb.StringValue, error) {
 		var last *pb.StringValue
-		for result := range r.Seq() {
+		for result := range r.Results() {
 			if result.Err != nil {
 				return nil, result.Err
 			}
 			last = result.Value
 		}
 		if last == nil {
-			return nil, errors.New("Seq: no responses received")
+			return nil, errors.New("Results: no responses received")
 		}
 		return last, nil
 	}
@@ -452,7 +461,7 @@ func TestSystemHandlerCanChainQuorumCallViaConfig(t *testing.T) {
 	}{
 		{name: "Majority", innerFn: respType.Majority, outerFn: respType.Majority},
 		{name: "All", innerFn: respType.All, outerFn: respType.All}, // Regression: .All() must not time out when self-node is included.
-		{name: "Seq", innerFn: seqAll, outerFn: respType.All},       // Regression: draining .Seq() to exhaustion must not time out when self-node is included.
+		{name: "Results", innerFn: seqAll, outerFn: respType.All},   // Regression: draining .Results() to exhaustion must not time out when self-node is included.
 	}
 
 	for _, tt := range tests {
@@ -745,4 +754,107 @@ func TestSystemLocalDispatchContentionSlowReplica(t *testing.T) {
 	if result.GetValue() != "echo: all-call" {
 		t.Errorf("All: got %q, want %q", result.GetValue(), "echo: all-call")
 	}
+}
+
+func TestWaitForConfig(t *testing.T) {
+	t.Run("ConditionAlreadyMet", func(t *testing.T) {
+		systems := gorums.TestSystems(t, 3)
+		awaitSystemReady(t, systems)
+
+		ctx := gorums.TestContext(t, 2*time.Second)
+		if err := systems[0].WaitForConfig(ctx, func(cfg gorums.Configuration) bool {
+			return cfg.Size() == 3
+		}); err != nil {
+			t.Fatalf("WaitForConfig: %v", err)
+		}
+	})
+
+	t.Run("ConditionMetAfterConnect", func(t *testing.T) {
+		systems := gorums.TestSystems(t, 3)
+
+		ctx := gorums.TestContext(t, 5*time.Second)
+		if err := systems[0].WaitForConfig(ctx, func(cfg gorums.Configuration) bool {
+			return cfg.Size() == 3
+		}); err != nil {
+			t.Fatalf("WaitForConfig: %v", err)
+		}
+	})
+
+	t.Run("ContextCancelled", func(t *testing.T) {
+		sys, err := gorums.NewSystem("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("NewSystem: %v", err)
+		}
+		go func() { _ = sys.Serve() }()
+		t.Cleanup(func() { _ = sys.Stop() })
+
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		err = sys.WaitForConfig(ctx, func(cfg gorums.Configuration) bool {
+			return cfg.Size() == 3 // never true
+		})
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected DeadlineExceeded, got: %v", err)
+		}
+	})
+
+	t.Run("SystemStopped", func(t *testing.T) {
+		sys, err := gorums.NewSystem("127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("NewSystem: %v", err)
+		}
+		go func() { _ = sys.Serve() }()
+
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- sys.WaitForConfig(context.Background(), func(cfg gorums.Configuration) bool {
+				return cfg.Size() == 3 // never true
+			})
+		}()
+
+		// Give WaitForConfig time to enter the select.
+		time.Sleep(20 * time.Millisecond)
+		_ = sys.Stop()
+
+		select {
+		case err := <-errCh:
+			if !errors.Is(err, gorums.ErrStopped) {
+				t.Fatalf("expected ErrStopped, got: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("WaitForConfig did not return after Stop")
+		}
+	})
+
+	t.Run("ConcurrentWaiters", func(t *testing.T) {
+		systems := gorums.TestSystems(t, 3)
+
+		const waiters = 5
+		errCh := make(chan error, waiters)
+		for range waiters {
+			ctx := gorums.TestContext(t, 5*time.Second)
+			go func(ctx context.Context) {
+				errCh <- systems[0].WaitForConfig(ctx, func(cfg gorums.Configuration) bool {
+					return cfg.Size() == 3
+				})
+			}(ctx)
+		}
+
+		for range waiters {
+			if err := <-errCh; err != nil {
+				t.Errorf("WaitForConfig: %v", err)
+			}
+		}
+	})
+
+	t.Run("ClientConfig", func(t *testing.T) {
+		sysServer, _, _ := createClientServerSystems(t)
+
+		ctx := gorums.TestContext(t, 5*time.Second)
+		if err := sysServer.WaitForClientConfig(ctx, func(cfg gorums.Configuration) bool {
+			return cfg.Size() == 1
+		}); err != nil {
+			t.Fatalf("WaitForClientConfig: %v", err)
+		}
+	})
 }

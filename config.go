@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 )
 
 // Configuration represents a static set of nodes on which multicast or
@@ -155,7 +156,7 @@ func (c Configuration) Add(ids ...uint32) Configuration {
 			}
 		}
 	}
-	OrderedBy(ID).Sort(nodes)
+	slices.SortFunc(nodes, ID)
 	return nodes
 }
 
@@ -195,6 +196,99 @@ func (c Configuration) Difference(other Configuration) Configuration {
 		return slices.Clone(c)
 	}
 	return c.Remove(other.NodeIDs()...)
+}
+
+// SortBy returns a new Configuration with nodes ordered by the given comparator.
+// The original configuration is not modified.
+//
+// Use this with the built-in node comparator functions [ID], [LastNodeError],
+// and [Latency]:
+//
+//	fastest := cfg.SortBy(gorums.Latency)           // ascending by latency
+//	healthy := cfg.SortBy(gorums.LastNodeError)     // no-error nodes first
+//
+// Comparators can be combined for multi-key ordering:
+//
+//	cfg.SortBy(func(a, b *Node) int {
+//	    if r := gorums.LastNodeError(a, b); r != 0 {
+//	        return r
+//	    }
+//	    return gorums.Latency(a, b)
+//	})
+//
+// SortBy uses a stable sort, so nodes with equal comparator values retain
+// their original relative order.
+//
+// Note: quorum calls contact every node in the configuration regardless of
+// order. Sorting only affects which nodes are selected when the result is
+// sliced to a smaller subset, e.g., cfg.SortBy(gorums.Latency)[:quorumSize].
+// See the "Latency-Based Node Selection" section of the user guide for
+// guidance on sub-configuration sizing and re-sort frequency.
+func (c Configuration) SortBy(cmp func(*Node, *Node) int) Configuration {
+	if len(c) == 0 {
+		return nil
+	}
+	sorted := slices.Clone(c)
+	slices.SortStableFunc(sorted, cmp)
+	return sorted
+}
+
+// Watch starts a background goroutine that calls derive(c) every interval and
+// emits the result on the returned channel whenever it differs from the previous
+// result. The initial result is always emitted before the first tick, so callers
+// always receive a valid configuration immediately. The interval must be greater
+// than zero, and derive must be non-nil; otherwise, Watch will panic.
+//
+// The derive function receives the full configuration c and returns any derived
+// sub-configuration. Typical examples:
+//
+//	// Latency-based top-k subset:
+//	cfg.Watch(ctx, 5*time.Second, func(c gorums.Configuration) gorums.Configuration {
+//	    return c.SortBy(gorums.Latency)[:quorumSize]
+//	})
+//
+//	// Skip failed nodes first, then pick fastest:
+//	cfg.Watch(ctx, 5*time.Second, func(c gorums.Configuration) gorums.Configuration {
+//	    return c.WithoutErrors(lastErr).SortBy(gorums.Latency)[:quorumSize]
+//	})
+//
+// The returned channel has a buffer of 1. If the consumer is slow and has not
+// yet read the previous update, the goroutine skips the emission and waits for
+// the next tick to re-evaluate.
+//
+// The goroutine exits and the channel is closed when ctx is cancelled.
+func (c Configuration) Watch(ctx context.Context, interval time.Duration, derive func(Configuration) Configuration) <-chan Configuration {
+	if interval <= 0 {
+		panic("gorums: Watch interval must be positive")
+	}
+	if derive == nil {
+		panic("gorums: Watch derive function must be non-nil")
+	}
+	ch := make(chan Configuration, 1)
+	go func() {
+		defer close(ch)
+		current := derive(c)
+		ch <- current
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				fresh := derive(c)
+				if !fresh.Equal(current) {
+					current = fresh
+					select {
+					case ch <- current:
+					default: // consumer hasn't read yet; next tick will re-evaluate
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
 }
 
 // WithoutErrors returns a new Configuration excluding nodes that failed in the
