@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -58,14 +59,12 @@ The command performs the write quorum call on node 0 and 2
 const delayOutput = 200 * time.Millisecond
 
 type repl struct {
-	mgr  *pb.Manager
 	cfg  pb.Configuration
 	term *term.Terminal
 }
 
-func newRepl(mgr *pb.Manager, cfg pb.Configuration) *repl {
+func newRepl(cfg pb.Configuration) *repl {
 	return &repl{
-		mgr: mgr,
 		cfg: cfg,
 		term: term.NewTerminal(struct {
 			io.Reader
@@ -92,9 +91,9 @@ func (r repl) ReadLine() (string, error) {
 }
 
 // Repl runs an interactive Read-eval-print loop, that allows users to run commands that perform
-// RPCs and quorum calls using the manager and configuration.
-func Repl(mgr *pb.Manager, defaultCfg pb.Configuration) error {
-	r := newRepl(mgr, defaultCfg)
+// RPCs and quorum calls using the configuration.
+func Repl(defaultCfg pb.Configuration) error {
+	r := newRepl(defaultCfg)
 
 	fmt.Println(help)
 	for {
@@ -140,7 +139,7 @@ func Repl(mgr *pb.Manager, defaultCfg pb.Configuration) error {
 			r.multicast(args[1:])
 		case "nodes":
 			fmt.Println("Nodes: ")
-			for i, n := range mgr.Nodes() {
+			for i, n := range r.cfg.Nodes() {
 				fmt.Printf("%d: %s\n", i, n.Address())
 			}
 		default:
@@ -434,17 +433,17 @@ func (repl) writeNestedMulticast(args []string, config pb.Configuration) {
 }
 
 func (r repl) parseConfiguration(cfgStr string) (pb.Configuration, error) {
-	indices, err := parseIndices(cfgStr, r.mgr.Size())
+	indices, err := parseIndices(cfgStr, r.cfg.Size())
 	if err != nil {
 		return nil, err
 	}
 
 	nodes := make([]*pb.Node, 0, len(indices))
-	mgrNodes := r.mgr.Nodes()
+	cfgNodes := r.cfg.Nodes()
 	for _, i := range indices {
-		nodes = append(nodes, mgrNodes[i])
+		nodes = append(nodes, cfgNodes[i])
 	}
-	gorums.OrderedBy(gorums.ID).Sort(nodes)
+	slices.SortFunc(nodes, gorums.ID)
 	return pb.Configuration(nodes), nil
 }
 

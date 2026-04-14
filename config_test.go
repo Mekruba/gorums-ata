@@ -2,6 +2,9 @@ package gorums_test
 
 import (
 	"errors"
+	"fmt"
+	"slices"
+	"sync"
 	"testing"
 
 	"github.com/relab/gorums"
@@ -25,7 +28,7 @@ func (n testNode) Addr() string {
 	return n.addr
 }
 
-func TestNewConfiguration(t *testing.T) {
+func TestNewConfig(t *testing.T) {
 	tests := []struct {
 		name     string
 		opt      gorums.NodeListOption
@@ -45,12 +48,12 @@ func TestNewConfiguration(t *testing.T) {
 		{
 			name:    "WithNodeList/Reject/EmptyNodeList",
 			opt:     gorums.WithNodeList([]string{}),
-			wantErr: "config: missing required node addresses",
+			wantErr: "gorums: missing required node addresses",
 		},
 		{
 			name:    "WithNodes/Reject/EmptyNodeMap",
 			opt:     gorums.WithNodes(map[uint32]testNode{}),
-			wantErr: "config: missing required node map",
+			wantErr: "gorums: missing required node map",
 		},
 		{
 			name: "WithNodes/Reject/ZeroID",
@@ -58,7 +61,7 @@ func TestNewConfiguration(t *testing.T) {
 				0: {addr: "127.0.0.1:9080"}, // ID 0 should be rejected
 				1: {addr: "127.0.0.1:9081"},
 			}),
-			wantErr: "config: node 0 is reserved",
+			wantErr: "gorums: node 0 is reserved",
 		},
 		{
 			name: "WithNodes/Reject/DuplicateAddress",
@@ -66,7 +69,7 @@ func TestNewConfiguration(t *testing.T) {
 				1: {addr: "127.0.0.1:9081"},
 				2: {addr: "127.0.0.1:9081"}, // Duplicate address
 			}),
-			wantErr: `config: address "127.0.0.1:9081" already in use by node 1`,
+			wantErr: `gorums: address "127.0.0.1:9081" already in use by node 1`,
 		},
 		{
 			name: "WithNodeList/Reject/DuplicateAddress",
@@ -74,7 +77,7 @@ func TestNewConfiguration(t *testing.T) {
 				"127.0.0.1:9081",
 				"127.0.0.1:9081", // Duplicate address
 			}),
-			wantErr: `config: address "127.0.0.1:9081" already in use by node 1`,
+			wantErr: `gorums: address "127.0.0.1:9081" already in use by node 1`,
 		},
 		{
 			name: "WithNodes/Reject/NormalizedDuplicateAddress",
@@ -82,7 +85,7 @@ func TestNewConfiguration(t *testing.T) {
 				1: {addr: "localhost:9081"},
 				2: {addr: "127.0.0.1:9081"}, // Same resolved address
 			}),
-			wantErr: `config: address "127.0.0.1:9081" already in use by node 1`,
+			wantErr: `gorums: address "127.0.0.1:9081" already in use by node 1`,
 		},
 		{
 			name: "WithNodeList/Reject/NormalizedDuplicateAddress",
@@ -90,15 +93,15 @@ func TestNewConfiguration(t *testing.T) {
 				"localhost:9081",
 				"127.0.0.1:9081", // Same resolved address
 			}),
-			wantErr: `config: address "127.0.0.1:9081" already in use by node 1`,
+			wantErr: `gorums: address "127.0.0.1:9081" already in use by node 1`,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-			t.Cleanup(gorums.Closer(t, mgr))
-
-			cfg, err := gorums.NewConfiguration(mgr, tt.opt)
+			cfg, err := gorums.NewConfig(tt.opt, gorums.InsecureDialOptions(t))
+			if err == nil {
+				t.Cleanup(gorums.Closer(t, cfg))
+			}
 			if tt.wantErr != "" {
 				if err == nil {
 					t.Fatalf("Error = nil, want %q", tt.wantErr)
@@ -114,11 +117,215 @@ func TestNewConfiguration(t *testing.T) {
 			if cfg.Size() != tt.wantSize {
 				t.Errorf("cfg.Size() = %d, want %d", cfg.Size(), tt.wantSize)
 			}
-			if mgr.Size() != tt.wantSize {
-				t.Errorf("mgr.Size() = %d, want %d", mgr.Size(), tt.wantSize)
-			}
 		})
 	}
+}
+
+func TestEmptyConfiguration(t *testing.T) {
+	var empty gorums.Configuration
+
+	populated, err := gorums.NewConfig(gorums.WithNodeList(nodes), gorums.InsecureDialOptions(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gorums.Closer(t, populated))
+
+	t.Run("ContextPanics", func(t *testing.T) {
+		assertPanicMessage(t, "gorums: Context called on an empty configuration", func() {
+			_ = empty.Context(t.Context())
+		})
+	})
+
+	t.Run("ExtendReturnsError", func(t *testing.T) {
+		got, err := empty.Extend(nil)
+		if err == nil {
+			t.Fatal("empty.Extend(nil) error = nil, want non-nil")
+		}
+		wantErr := "gorums: cannot extend empty configuration"
+		if err.Error() != wantErr {
+			t.Fatalf("empty.Extend(nil) error = %q, want %q", err.Error(), wantErr)
+		}
+		if got != nil {
+			t.Fatalf("empty.Extend(nil) cfg = %v, want nil", got)
+		}
+	})
+
+	t.Run("NodeIDsEmpty", func(t *testing.T) {
+		got := empty.NodeIDs()
+		if len(got) != 0 {
+			t.Fatalf("len(empty.NodeIDs()) = %d, want 0", len(got))
+		}
+		if got == nil {
+			t.Fatal("empty.NodeIDs() = nil, want empty slice")
+		}
+	})
+
+	t.Run("NodesNil", func(t *testing.T) {
+		if got := empty.Nodes(); got != nil {
+			t.Fatalf("empty.Nodes() = %v, want nil", got)
+		}
+	})
+
+	t.Run("SizeZero", func(t *testing.T) {
+		if got := empty.Size(); got != 0 {
+			t.Fatalf("empty.Size() = %d, want 0", got)
+		}
+	})
+
+	t.Run("Equal", func(t *testing.T) {
+		var otherEmpty gorums.Configuration
+		if !empty.Equal(otherEmpty) {
+			t.Fatal("empty.Equal(otherEmpty) = false, want true")
+		}
+		if empty.Equal(populated) {
+			t.Fatal("empty.Equal(populated) = true, want false")
+		}
+	})
+
+	t.Run("CloseNil", func(t *testing.T) {
+		if err := empty.Close(); err != nil {
+			t.Fatalf("empty.Close() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("ContainsFalse", func(t *testing.T) {
+		if empty.Contains(1) {
+			t.Fatal("empty.Contains(1) = true, want false")
+		}
+	})
+
+	t.Run("AddNil", func(t *testing.T) {
+		if got := empty.Add(1, 2, 3); got != nil {
+			t.Fatalf("empty.Add(...) = %v, want nil", got)
+		}
+	})
+
+	t.Run("UnionWithEmptyNil", func(t *testing.T) {
+		var otherEmpty gorums.Configuration
+		if got := empty.Union(otherEmpty); got != nil {
+			t.Fatalf("empty.Union(otherEmpty) = %v, want nil", got)
+		}
+	})
+
+	t.Run("UnionWithNonEmptyClonesOther", func(t *testing.T) {
+		got := empty.Union(populated)
+		if !got.Equal(populated) {
+			t.Fatal("empty.Union(populated) != populated")
+		}
+		gotNodes := got.Nodes()
+		populatedNodes := populated.Nodes()
+		if len(gotNodes) == 0 {
+			t.Fatal("empty.Union(populated) returned empty configuration")
+		}
+		if &gotNodes[0] == &populatedNodes[0] {
+			t.Fatal("empty.Union(populated) shares backing array with populated")
+		}
+	})
+
+	t.Run("RemoveNil", func(t *testing.T) {
+		if got := empty.Remove(1, 2, 3); got != nil {
+			t.Fatalf("empty.Remove(...) = %v, want nil", got)
+		}
+	})
+
+	t.Run("DifferenceNil", func(t *testing.T) {
+		if got := empty.Difference(populated); got != nil {
+			t.Fatalf("empty.Difference(populated) = %v, want nil", got)
+		}
+	})
+
+	t.Run("WithoutErrorsNil", func(t *testing.T) {
+		qcErr := gorums.TestQuorumCallError(t, map[uint32]error{1: errors.New("boom")})
+		if got := empty.WithoutErrors(qcErr); got != nil {
+			t.Fatalf("empty.WithoutErrors(...) = %v, want nil", got)
+		}
+	})
+}
+
+func TestConfigurationSortBy(t *testing.T) {
+	cfg, err := gorums.NewConfig(gorums.WithNodeList(nodes), gorums.InsecureDialOptions(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gorums.Closer(t, cfg))
+
+	t.Run("SortByID", func(t *testing.T) {
+		sorted := cfg.SortBy(gorums.ID)
+		if sorted.Size() != cfg.Size() {
+			t.Fatalf("sorted.Size() = %d, want %d", sorted.Size(), cfg.Size())
+		}
+		for i := 1; i < sorted.Size(); i++ {
+			if sorted[i].ID() < sorted[i-1].ID() {
+				t.Errorf("SortBy(ID): not sorted at position %d (id %d < id %d)",
+					i, sorted[i].ID(), sorted[i-1].ID())
+			}
+		}
+	})
+
+	t.Run("SortByLatency/AllUnmeasured", func(t *testing.T) {
+		// Fresh config: no calls yet, so all nodes report latency < 0.
+		for _, n := range cfg.Nodes() {
+			if n.Latency() >= 0 {
+				t.Fatalf("expected no latency measurement on fresh node, got %v", n.Latency())
+			}
+		}
+		sorted := cfg.SortBy(gorums.Latency)
+		if sorted.Size() != cfg.Size() {
+			t.Fatalf("sorted.Size() = %d, want %d", sorted.Size(), cfg.Size())
+		}
+		// When all nodes are unmeasured their reported latencies are all -1; thus, the
+		// Latency comparator returns 0 for every latency pair (the latencies are equal),
+		// so a stable sort must preserve the original order.
+		if got, want := sorted.NodeIDs(), cfg.NodeIDs(); !slices.Equal(got, want) {
+			t.Errorf("SortBy(Latency) with all-unmeasured nodes changed order: got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("ReturnsNewConfiguration", func(t *testing.T) {
+		sorted := cfg.SortBy(gorums.ID)
+		cfgSlice := cfg.Nodes()
+		sortedSlice := sorted.Nodes()
+		if len(cfgSlice) > 0 && len(sortedSlice) > 0 && &cfgSlice[0] == &sortedSlice[0] {
+			t.Error("SortBy returned same backing array — violates immutability")
+		}
+	})
+
+	t.Run("Empty/ReturnsNil", func(t *testing.T) {
+		var empty gorums.Configuration
+		if got := empty.SortBy(gorums.ID); got != nil {
+			t.Fatalf("empty.SortBy(ID) = %v, want nil", got)
+		}
+		if got := empty.SortBy(gorums.Latency); got != nil {
+			t.Fatalf("empty.SortBy(Latency) = %v, want nil", got)
+		}
+	})
+
+	t.Run("SortByLastNodeErrorThenLatency", func(t *testing.T) {
+		// Composing two comparators should not panic and must return a valid config.
+		sorted := cfg.SortBy(func(a, b *gorums.Node) int {
+			if r := gorums.LastNodeError(a, b); r != 0 {
+				return r
+			}
+			return gorums.Latency(a, b)
+		})
+		if sorted.Size() != cfg.Size() {
+			t.Fatalf("composed sort size = %d, want %d", sorted.Size(), cfg.Size())
+		}
+	})
+}
+
+func assertPanicMessage(t *testing.T, want string, fn func()) {
+	t.Helper()
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("expected panic %q, got no panic", want)
+		}
+		if got := fmt.Sprint(r); got != want {
+			t.Fatalf("panic = %q, want %q", got, want)
+		}
+	}()
+	fn()
 }
 
 func TestConfigurationExtend(t *testing.T) {
@@ -158,7 +365,7 @@ func TestConfigurationExtend(t *testing.T) {
 			extendOpt: gorums.WithNodes(map[uint32]testNode{
 				0: {addr: "127.0.0.1:9090"}, // ID 0 should be rejected
 			}),
-			wantErr: "config: node 0 is reserved",
+			wantErr: "gorums: node 0 is reserved",
 		},
 		{
 			name:         "WithNodes/Reject/IDConflict",
@@ -166,7 +373,7 @@ func TestConfigurationExtend(t *testing.T) {
 			extendOpt: gorums.WithNodes(map[uint32]testNode{
 				2: {addr: "127.0.0.1:9090"}, // ID 2 already exists, rejected
 			}),
-			wantErr: `config: node 2 already in use by "127.0.0.1:9082"`,
+			wantErr: `gorums: node 2 already in use by "127.0.0.1:9082"`,
 		},
 		{
 			name:         "WithNodes/Reject/AddressConflict",
@@ -174,7 +381,7 @@ func TestConfigurationExtend(t *testing.T) {
 			extendOpt: gorums.WithNodes(map[uint32]testNode{
 				3: {addr: "127.0.0.1:9081"}, // Same address as ID 1
 			}),
-			wantErr: `config: address "127.0.0.1:9081" already in use by node 1`,
+			wantErr: `gorums: address "127.0.0.1:9081" already in use by node 1`,
 		},
 		{
 			name:         "WithNodes/Reject/NormalizedAddressConflict",
@@ -182,18 +389,16 @@ func TestConfigurationExtend(t *testing.T) {
 			extendOpt: gorums.WithNodes(map[uint32]testNode{
 				3: {addr: "localhost:9081"}, // Resolves to same as existing node 1
 			}),
-			wantErr: `config: address "127.0.0.1:9081" already in use by node 1`,
+			wantErr: `gorums: address "127.0.0.1:9081" already in use by node 1`,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-			t.Cleanup(gorums.Closer(t, mgr))
-
-			c, err := gorums.NewConfiguration(mgr, gorums.WithNodeList(tt.initialNodes))
+			c, err := gorums.NewConfig(gorums.WithNodeList(tt.initialNodes), gorums.InsecureDialOptions(t))
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(gorums.Closer(t, c))
 
 			c2, err := c.Extend(tt.extendOpt)
 			if tt.wantErr != "" {
@@ -211,21 +416,59 @@ func TestConfigurationExtend(t *testing.T) {
 			if c2.Size() != tt.wantSize {
 				t.Errorf("c2.Size() = %d, want %d", c2.Size(), tt.wantSize)
 			}
-			if mgr.Size() != tt.wantSize {
-				t.Errorf("mgr.Size() = %d, want %d", mgr.Size(), tt.wantSize)
-			}
 		})
 	}
 }
 
-func TestConfigurationAdd(t *testing.T) {
-	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-	t.Cleanup(gorums.Closer(t, mgr))
+func TestConfigurationExtendConcurrent(t *testing.T) {
+	addrs := gorums.TestServers(t, 6, func(_ int) gorums.ServerIface { return gorums.NewServer() })
 
-	c1, err := gorums.NewConfiguration(mgr, gorums.WithNodeList(nodes)) // c1 = {1, 2, 3}
+	// Create base configuration so that concurrent Extend operations share the same node registry.
+	cfg, err := gorums.NewConfig(gorums.WithNodeList(addrs[0:1]), gorums.TestDialOptions(t))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(gorums.Closer(t, cfg))
+
+	// Create multiple node maps to extend with, each containing a unique new node.
+	// These maps will be used concurrently to verify that Extend can safely mutate
+	// the shared node registry under concurrent use (race-free configuration creation).
+	nodeMaps := []map[uint32]testNode{
+		{2: {addr: addrs[1]}},
+		{3: {addr: addrs[2]}},
+		{4: {addr: addrs[3]}},
+		{5: {addr: addrs[4]}},
+		{6: {addr: addrs[5]}},
+	}
+
+	errCh := make(chan error, len(nodeMaps))
+	var wg sync.WaitGroup
+	for i := range nodeMaps {
+		wg.Go(func() {
+			// Exercise concurrent configuration creation against the same node registry.
+			c, err := cfg.Extend(gorums.WithNodes(nodeMaps[i]))
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if c.Size() != 2 {
+				errCh <- fmt.Errorf("c.Size() = %d, want 2", c.Size())
+			}
+		})
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+}
+
+func TestConfigurationAdd(t *testing.T) {
+	c1, err := gorums.NewConfig(gorums.WithNodeList(nodes), gorums.InsecureDialOptions(t)) // c1 = {1, 2, 3}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(gorums.Closer(t, c1))
 	if c1.Size() != len(nodes) {
 		t.Errorf("c1.Size() = %d, want %d", c1.Size(), len(nodes))
 	}
@@ -248,13 +491,11 @@ func TestConfigurationAdd(t *testing.T) {
 }
 
 func TestConfigurationUnion(t *testing.T) {
-	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-	t.Cleanup(gorums.Closer(t, mgr))
-
-	c1, err := gorums.NewConfiguration(mgr, gorums.WithNodeList(nodes)) // c1 = {1, 2, 3}
+	c1, err := gorums.NewConfig(gorums.WithNodeList(nodes), gorums.InsecureDialOptions(t)) // c1 = {1, 2, 3}
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(gorums.Closer(t, c1))
 
 	// Add newNodes to c1 using Extend (gets IDs 4, 5)
 	newNodes := []string{"127.0.0.1:9084", "127.0.0.1:9085"}
@@ -292,13 +533,11 @@ func TestConfigurationUnion(t *testing.T) {
 }
 
 func TestConfigurationRemove(t *testing.T) {
-	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-	t.Cleanup(gorums.Closer(t, mgr))
-
-	c1, err := gorums.NewConfiguration(mgr, gorums.WithNodeList(nodes)) // c1 = {1, 2, 3}
+	c1, err := gorums.NewConfig(gorums.WithNodeList(nodes), gorums.InsecureDialOptions(t)) // c1 = {1, 2, 3}
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(gorums.Closer(t, c1))
 
 	// Remove one node using Remove
 	c2 := c1.Remove(c1[0].ID()) // c2 = {2, 3}
@@ -308,13 +547,11 @@ func TestConfigurationRemove(t *testing.T) {
 }
 
 func TestConfigurationDifference(t *testing.T) {
-	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-	t.Cleanup(gorums.Closer(t, mgr))
-
-	c1, err := gorums.NewConfiguration(mgr, gorums.WithNodeList(nodes)) // c1 = {1, 2, 3}
+	c1, err := gorums.NewConfig(gorums.WithNodeList(nodes), gorums.InsecureDialOptions(t)) // c1 = {1, 2, 3}
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(gorums.Closer(t, c1))
 
 	newNodes := []string{"127.0.0.1:9084", "127.0.0.1:9085"}
 	c3, err := c1.Extend(gorums.WithNodeList(newNodes)) // c3 = {1, 2, 3, 4, 5}
@@ -330,14 +567,12 @@ func TestConfigurationDifference(t *testing.T) {
 }
 
 func TestConfigurationAddDuplicateIDs(t *testing.T) {
-	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-	t.Cleanup(gorums.Closer(t, mgr))
-
 	// Create configuration with all three nodes
-	c2, err := gorums.NewConfiguration(mgr, gorums.WithNodeList(nodes)) // c2 = {1, 2, 3}
+	c2, err := gorums.NewConfig(gorums.WithNodeList(nodes), gorums.InsecureDialOptions(t)) // c2 = {1, 2, 3}
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(gorums.Closer(t, c2))
 	// Create c1 by removing node 3
 	c1 := c2.Remove(3) // c1 = {1, 2}
 
@@ -355,14 +590,12 @@ func TestConfigurationAddDuplicateIDs(t *testing.T) {
 }
 
 func TestConfigurationUnionDuplicateNodes(t *testing.T) {
-	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-	t.Cleanup(gorums.Closer(t, mgr))
-
 	// Create configuration with nodes 1, 2, 3
-	c1, err := gorums.NewConfiguration(mgr, gorums.WithNodeList(nodes))
+	c1, err := gorums.NewConfig(gorums.WithNodeList(nodes), gorums.InsecureDialOptions(t))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(gorums.Closer(t, c1))
 
 	// Create subset configurations
 	c2 := c1.Remove(2, 3) // c2 = {1}
@@ -386,13 +619,11 @@ func TestConfigurationUnionDuplicateNodes(t *testing.T) {
 }
 
 func TestConfigurationImmutability(t *testing.T) {
-	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-	t.Cleanup(gorums.Closer(t, mgr))
-
-	c1, err := gorums.NewConfiguration(mgr, gorums.WithNodeList(nodes))
+	c1, err := gorums.NewConfig(gorums.WithNodeList(nodes), gorums.InsecureDialOptions(t))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(gorums.Closer(t, c1))
 
 	// Test Union with empty returns a clone, not the original
 	var emptyConfig gorums.Configuration
@@ -425,13 +656,11 @@ func TestConfigurationImmutability(t *testing.T) {
 }
 
 func TestConfigurationWithoutErrors(t *testing.T) {
-	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-	t.Cleanup(gorums.Closer(t, mgr))
-
-	cfg, err := gorums.NewConfiguration(mgr, gorums.WithNodes(nodeMap))
+	cfg, err := gorums.NewConfig(gorums.WithNodes(nodeMap), gorums.InsecureDialOptions(t))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(gorums.Closer(t, cfg))
 
 	timeoutErr := errors.New("timeout")
 	connRefusedErr := errors.New("connection refused")

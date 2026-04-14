@@ -12,27 +12,30 @@ import (
 
 // serverOptions contains configuration options for creating a new Server.
 type serverOptions struct {
-	buffer          uint
+	recvBufferSize  uint
+	sendBufferSize  uint
 	grpcOpts        []grpc.ServerOption
 	connectCallback func(context.Context)
 	interceptors    []Interceptor
 	// Peer management options
 	myID           uint32
 	peerOpt        NodeListOption
-	peerSendBuffer uint
 	onConfigChange func(Configuration)
 }
 
 // ServerOption is used to change settings for the GorumsServer
 type ServerOption func(*serverOptions)
 
-func (ServerOption) isOption() {}
-
-// WithReceiveBufferSize sets the buffer size for the server.
-// A larger buffer may result in higher throughput at the cost of higher latency.
-func WithReceiveBufferSize(size uint) ServerOption {
+// WithBufferSizes configures the send and receive buffer sizes for the server.
+// The receiveSize controls how many messages the server queues before applying
+// backpressure. Similarly, sendSize controls how many messages the server queues
+// on its per-node channel for outgoing peer messages in the reverse direction.
+// Larger values may increase throughput at the cost of higher latency.
+// The default for both is 0 (unbuffered).
+func WithBufferSizes(receiveSize, sendSize uint) ServerOption {
 	return func(o *serverOptions) {
-		o.buffer = size
+		o.recvBufferSize = receiveSize
+		o.sendBufferSize = sendSize
 	}
 }
 
@@ -86,15 +89,6 @@ func WithConfig(myID uint32, opt NodeListOption, onChange ...func(Configuration)
 	}
 }
 
-// WithPeerSendBufferSize sets the size of the per-node send buffer for channels
-// created when inbound peers connect. A larger buffer may increase throughput
-// for asynchronous call types at the cost of latency. The default is 0 (unbuffered).
-func WithPeerSendBufferSize(size uint) ServerOption {
-	return func(o *serverOptions) {
-		o.peerSendBuffer = size
-	}
-}
-
 // Server serves all ordering based RPCs using registered handlers.
 type Server struct {
 	srv          *stream.Server
@@ -130,33 +124,13 @@ func NewServer(opts ...ServerOption) *Server {
 	s.inboundManager = newInboundManager(
 		serverOpts.myID,
 		serverOpts.peerOpt,
-		serverOpts.peerSendBuffer,
+		serverOpts.sendBufferSize,
 		serverOpts.onConfigChange,
 		s,
 	)
-	s.srv = stream.NewServer(serverOpts.buffer, serverOpts.connectCallback, s.inboundManager)
+	s.srv = stream.NewServer(serverOpts.recvBufferSize, serverOpts.connectCallback, s.inboundManager)
 	stream.RegisterGorumsServer(s.grpcServer, s.srv)
 	return s
-}
-
-// NewConfig creates a new outbound [Configuration] connecting to the given nodes,
-// with this server installed as the back-channel request handler.
-// Use this method when creating a client-side configuration that must receive
-// reverse-direction calls from the server via [ServerCtx.ClientConfig].
-//
-// The client advertises no node ID; the remote server assigns it a dynamic ID
-// and includes it in [ClientConfig].
-//
-// Example:
-//
-//	clientSrv := gorums.NewServer()
-//	clientSrv.RegisterHandler(pb.MyMethod, myHandler)
-//	cfg, err := clientSrv.NewConfig(
-//	    gorums.WithNodeList(serverAddrs),
-//	    gorums.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
-//	)
-func (s *Server) NewConfig(opts ...Option) (Configuration, error) {
-	return NewConfig(append([]Option{withRequestHandler(s, 0)}, opts...)...)
 }
 
 // RegisterHandler registers a request handler for the specified method name.
@@ -190,14 +164,14 @@ func (s *Server) HandleRequest(ctx context.Context, reqMsg *stream.Message, rele
 	handler, ok := s.handlers[reqMsg.GetMethod()]
 	if !ok {
 		in := &Message{Message: reqMsg}
-		_ = srvCtx.SendMessage(MessageWithError(in, nil, status.Errorf(codes.Unimplemented, "no handler registered for method %s", reqMsg.GetMethod())))
+		srvCtx.SendMessage(MessageWithError(in, nil, status.Errorf(codes.Unimplemented, "no handler registered for method %s", reqMsg.GetMethod())))
 		return
 	}
 
 	msg, err := unmarshalRequest(reqMsg)
 	in := &Message{Msg: msg, Message: reqMsg}
 	if err != nil {
-		_ = srvCtx.SendMessage(MessageWithError(in, nil, err))
+		srvCtx.SendMessage(MessageWithError(in, nil, err))
 		return
 	}
 
@@ -208,7 +182,7 @@ func (s *Server) HandleRequest(ctx context.Context, reqMsg *stream.Message, rele
 	if out == nil && err == nil {
 		return
 	}
-	_ = srvCtx.SendMessage(MessageWithError(in, out, err))
+	srvCtx.SendMessage(MessageWithError(in, out, err))
 }
 
 // Serve starts serving on the listener.

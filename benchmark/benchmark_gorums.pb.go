@@ -18,60 +18,25 @@ const (
 	_ = gorums.EnforceVersion(gorums.MaxVersion - 11)
 )
 
-// Type aliases for important Gorums types to make them more accessible
-// from user code already interacting with the generated code.
+// The type aliases below are useful Gorums types that we make accessible
+// from generated code. These names therefore become reserved identifiers,
+// meaning that proto message types with these names would collide with the
+// generated aliases and cause a compile error.
+//
+// The bundler (gorums_bundle.go) is responsible for discovering these
+// aliases and any other identifiers defined herein, and adding them to
+// the reserved identifiers list.
+//
+// If necessary, additional aliases and other identifiers should be added in
+// the generator's cmd/protoc-gen-gorums/dev directory, and the bundler will
+// automatically discover them and add them to the reserved identifiers list.
+
 type (
 	Configuration = gorums.Configuration
-	Manager       = gorums.Manager
 	Node          = gorums.Node
 	NodeContext   = gorums.NodeContext
 	ConfigContext = gorums.ConfigContext
 )
-
-// Use the aliased types to add them to the reserved identifiers list.
-// This prevents users from defining message types with these names.
-var (
-	_ = (*Configuration)(nil)
-	_ = (*Manager)(nil)
-	_ = (*Node)(nil)
-	_ = (*NodeContext)(nil)
-	_ = (*ConfigContext)(nil)
-)
-
-// NewManager returns a new Manager for managing connection to nodes added
-// to the manager. This function accepts manager options used to configure
-// various aspects of the manager.
-func NewManager(opts ...gorums.ManagerOption) *Manager {
-	return gorums.NewManager(opts...)
-}
-
-// NewConfiguration returns a configuration based on the provided list of nodes.
-// Nodes can be supplied using WithNodes or WithNodeList.
-// A new configuration can also be created from an existing configuration
-// using the Add, Union, Remove, Difference, Extend, and WithoutErrors methods.
-func NewConfiguration(mgr *Manager, opt gorums.NodeListOption) (Configuration, error) {
-	return gorums.NewConfiguration(mgr, opt)
-}
-
-// NewConfig returns a new [Configuration] based on the provided [gorums.Option]s.
-// It accepts exactly one [gorums.NodeListOption] and multiple [gorums.ManagerOption]s.
-// You may use this function to create the initial configuration for a new manager.
-//
-// Example:
-//
-//		cfg, err := NewConfig(
-//		    gorums.WithNodeList([]string{"localhost:8080", "localhost:8081", "localhost:8082"}),
-//	        gorums.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
-//		)
-//
-// This is a convenience function for creating a configuration without explicitly
-// creating a manager first. However, the manager can be accessed using the
-// [Configuration.Manager] method. This method should only be used once since it
-// creates a new manager; if a manager already exists, use [NewConfiguration]
-// instead, and provide the existing manager as the first argument.
-func NewConfig(opts ...gorums.Option) (Configuration, error) {
-	return gorums.NewConfig(opts...)
-}
 
 // AsyncEcho is a future for async quorum calls returning *Echo.
 type AsyncEcho = *gorums.Async[*Echo]
@@ -155,13 +120,13 @@ func Multicast(ctx *ConfigContext, in *TimedMsg, opts ...gorums.CallOption) erro
 
 // Benchmark is the server-side API for the Benchmark Service
 type BenchmarkServer interface {
-	StartServerBenchmark(ctx gorums.ServerCtx, request *StartRequest) (response *StartResponse, err error)
-	StopServerBenchmark(ctx gorums.ServerCtx, request *StopRequest) (response *Result, err error)
-	StartBenchmark(ctx gorums.ServerCtx, request *StartRequest) (response *StartResponse, err error)
-	StopBenchmark(ctx gorums.ServerCtx, request *StopRequest) (response *MemoryStat, err error)
-	QuorumCall(ctx gorums.ServerCtx, request *Echo) (response *Echo, err error)
-	SlowServer(ctx gorums.ServerCtx, request *Echo) (response *Echo, err error)
-	Multicast(ctx gorums.ServerCtx, request *TimedMsg)
+	StartServerBenchmark(gorums.ServerCtx, *StartRequest) (*StartResponse, error)
+	StopServerBenchmark(gorums.ServerCtx, *StopRequest) (*Result, error)
+	StartBenchmark(gorums.ServerCtx, *StartRequest) (*StartResponse, error)
+	StopBenchmark(gorums.ServerCtx, *StopRequest) (*MemoryStat, error)
+	QuorumCall(gorums.ServerCtx, *Echo) (*Echo, error)
+	SlowServer(gorums.ServerCtx, *Echo) (*Echo, error)
+	Multicast(gorums.ServerCtx, *TimedMsg)
 }
 
 func RegisterBenchmarkServer(srv *gorums.Server, impl BenchmarkServer) {

@@ -1,11 +1,10 @@
 package gorums
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net"
-	"sort"
-	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -48,7 +47,7 @@ type Node struct {
 	// Only assigned at creation.
 	id   uint32
 	addr string
-	mgr  *Manager // only used for backward compatibility to allow Configuration.Manager()
+	mgr  *outboundManager // owning manager for this node
 
 	msgIDGen func() uint64
 	router   *stream.MessageRouter
@@ -64,7 +63,7 @@ type Node struct {
 //	resp, err := service.GRPCCall(nodeCtx, req)
 func (n *Node) Context(parent context.Context) *NodeContext {
 	if n == nil {
-		panic("gorums: Context called with nil node")
+		panic("gorums: Context called on nil node")
 	}
 	return &NodeContext{Context: parent, node: n}
 }
@@ -75,10 +74,9 @@ type nodeOptions struct {
 	SendBufferSize uint
 	MsgIDGen       func() uint64
 	Metadata       metadata.MD
-	PerNodeMD      func(uint32) metadata.MD
 	DialOpts       []grpc.DialOption
 	RequestHandler stream.RequestHandler
-	Manager        *Manager // only used for backward compatibility to allow Configuration.Manager()
+	Manager        *outboundManager // owning manager
 }
 
 // newOutboundNode creates a new node using the provided options. It establishes
@@ -105,9 +103,6 @@ func newOutboundNode(addr string, opts nodeOptions) (*Node, error) {
 
 	// Create outgoing context with metadata for this node's stream.
 	md := opts.Metadata.Copy()
-	if opts.PerNodeMD != nil {
-		md = metadata.Join(md, opts.PerNodeMD(n.id))
-	}
 	ctx := metadata.NewOutgoingContext(context.Background(), md)
 
 	// Create new outbound channel and establish gRPC node stream
@@ -133,7 +128,7 @@ func newInboundNode(id uint32, addr string, msgIDGen func() uint64, handler stre
 // network. It is used for the self-node when this process is both client and
 // server in a symmetric peer configuration. The provided handler (typically
 // the local *Server) serves requests directly without a gRPC round-trip.
-func newLocalNode(id uint32, addr string, msgIDGen func() uint64, handler stream.RequestHandler, mgr *Manager) *Node {
+func newLocalNode(id uint32, addr string, msgIDGen func() uint64, handler stream.RequestHandler, mgr *outboundManager) *Node {
 	router := stream.NewMessageRouter(handler)
 	n := &Node{
 		id:       id,
@@ -259,90 +254,64 @@ func (n *Node) LastErr() error {
 	return nil
 }
 
-// Latency returns the latency between the client and this node.
+// Latency returns the current round-trip latency estimate for this node,
+// computed as an exponentially weighted moving average with a
+// smoothing factor of 0.2 (roughly a 5-sample window).
+//
+// The returned value has several important limits:
+//   - It returns -1s until the first successful response is received; treat
+//     negative values as "no data" rather than a real measurement.
+//   - The estimate is only updated when there is active traffic. On an idle
+//     node the value may be arbitrarily stale and will not reflect recent
+//     changes in network conditions.
+//   - A step-change in latency takes several round trips to settle because
+//     each new sample contributes only 20% of the new value.
+//
+// Use the [Latency] comparator with [Configuration.SortBy] to order nodes
+// by their current observed latency.
 func (n *Node) Latency() time.Duration {
 	return n.router.Latency()
 }
 
-type lessFunc func(n1, n2 *Node) bool
-
-// MultiSorter implements the Sort interface, sorting the nodes within.
-type MultiSorter struct {
-	nodes []*Node
-	less  []lessFunc
+// ID compares nodes by their identifier in increasing order.
+// It is compatible with [slices.SortFunc] and [Configuration.SortBy].
+var ID = func(a, b *Node) int {
+	return cmp.Compare(a.id, b.id)
 }
 
-// Sort sorts the argument slice according to the less functions passed to
-// OrderedBy.
-func (ms *MultiSorter) Sort(nodes []*Node) {
-	ms.nodes = nodes
-	sort.Sort(ms)
-}
-
-// OrderedBy returns a Sorter that sorts using the less functions, in order.
-// Call its Sort method to sort the data.
-func OrderedBy(less ...lessFunc) *MultiSorter {
-	return &MultiSorter{
-		less: less,
+// LastNodeError compares nodes by their LastErr() status.
+// Nodes with no error sort before nodes with an error.
+// It is compatible with [slices.SortFunc] and [Configuration.SortBy].
+var LastNodeError = func(a, b *Node) int {
+	aErr := a.LastErr()
+	bErr := b.LastErr()
+	switch {
+	case aErr != nil && bErr == nil:
+		return 1
+	case aErr == nil && bErr != nil:
+		return -1
+	default:
+		return 0
 	}
 }
 
-// Len is part of sort.Interface.
-func (ms *MultiSorter) Len() int {
-	return len(ms.nodes)
-}
-
-// Swap is part of sort.Interface.
-func (ms *MultiSorter) Swap(i, j int) {
-	ms.nodes[i], ms.nodes[j] = ms.nodes[j], ms.nodes[i]
-}
-
-// Less is part of sort.Interface. It is implemented by looping along the
-// less functions until it finds a comparison that is either Less or not
-// Less. Note that it can call the less functions twice per call. We
-// could change the functions to return -1, 0, 1 and reduce the
-// number of calls for greater efficiency: an exercise for the reader.
-func (ms *MultiSorter) Less(i, j int) bool {
-	p, q := ms.nodes[i], ms.nodes[j]
-	// Try all but the last comparison.
-	var k int
-	for k = range len(ms.less) - 1 {
-		less := ms.less[k]
-		switch {
-		case less(p, q):
-			// p < q, so we have a decision.
-			return true
-		case less(q, p):
-			// p > q, so we have a decision.
-			return false
-		}
-		// p == q; try the next comparison.
+// Latency compares nodes by their current latency estimate in ascending order.
+// Nodes with no measurement yet (negative latency value) sort after nodes with a
+// measurement. It is compatible with [slices.SortFunc] and [Configuration.SortBy].
+var Latency = func(a, b *Node) int {
+	la, lb := a.Latency(), b.Latency()
+	// Note: cmp.Compare alone would sort negative sentinel values first
+	// (as the smallest numbers), making unmeasured nodes appear fastest.
+	// The switch guards against that by pushing any negative value to the end.
+	switch {
+	case la < 0 && lb < 0:
+		return 0
+	case la < 0:
+		return 1
+	case lb < 0:
+		return -1
 	}
-	// All comparisons to here said "equal", so just return whatever
-	// the final comparison reports.
-	return ms.less[k](p, q)
-}
-
-// ID sorts nodes by their identifier in increasing order.
-var ID = func(n1, n2 *Node) bool {
-	return n1.id < n2.id
-}
-
-// Port sorts nodes by their port number in increasing order.
-// Warning: This function may be removed in the future.
-var Port = func(n1, n2 *Node) bool {
-	p1, _ := strconv.Atoi(n1.Port())
-	p2, _ := strconv.Atoi(n2.Port())
-	return p1 < p2
-}
-
-// LastNodeError sorts nodes by their LastErr() status in increasing order. A
-// node with LastErr() != nil is larger than a node with LastErr() == nil.
-var LastNodeError = func(n1, n2 *Node) bool {
-	if n1.LastErr() != nil && n2.LastErr() == nil {
-		return false
-	}
-	return true
+	return cmp.Compare(la, lb)
 }
 
 // compile-time assertion for interface compliance.

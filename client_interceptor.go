@@ -64,63 +64,55 @@ type ClientCtx[Req, Resp msg] struct {
 	sendOnce sync.Once
 }
 
-// clientCtxBuilder provides an interface for constructing ClientCtx instances.
-type clientCtxBuilder[Req, Resp msg] struct {
-	c *ClientCtx[Req, Resp]
-	// chanMultiplier is the buffer multiplier for the reply channel.
-	// Default is 1; streaming calls use a larger multiplier.
-	chanMultiplier int
+// sendNow triggers request dispatch exactly once.
+func (c *ClientCtx[Req, Resp]) sendNow() {
+	c.sendOnce.Do(c.send)
 }
 
-// newClientCtxBuilder creates a new builder for constructing a ClientCtx.
-// The required parameters are provided upfront; optional settings use builder methods.
-// The metadata and reply channel are created at Build() time.
-func newClientCtxBuilder[Req, Resp msg](
+type clientCtxOptions struct {
+	streaming    bool
+	waitSendDone bool
+	interceptors []any
+}
+
+// newClientCtx constructs and initializes a ClientCtx for quorum-style calls.
+// It creates call metadata, configures the response iterator, and applies
+// interceptors after the base iterator has been established.
+func newClientCtx[Req, Resp msg](
 	ctx *ConfigContext,
 	req Req,
 	method string,
-) *clientCtxBuilder[Req, Resp] {
-	return &clientCtxBuilder[Req, Resp]{
-		c: &ClientCtx[Req, Resp]{
-			Context: ctx,
-			config:  ctx.Configuration(),
-			request: req,
-			method:  method,
-		},
-		chanMultiplier: 1,
+	opts clientCtxOptions,
+) *ClientCtx[Req, Resp] {
+	config := ctx.Configuration()
+	clientCtx := &ClientCtx[Req, Resp]{
+		Context:      ctx,
+		config:       config,
+		request:      req,
+		method:       method,
+		msgID:        config.nextMsgID(),
+		replyChan:    make(chan NodeResponse[*stream.Message], chanSize(config, opts.streaming)),
+		streaming:    opts.streaming,
+		waitSendDone: opts.waitSendDone,
 	}
-}
 
-// WithStreaming configures the clientCtx for streaming responses.
-// When enabled, the response iterator continues until context cancellation
-// rather than stopping after expectedReplies responses.
-// It also increases the reply channel buffer size (10x) to handle streaming volume.
-func (b *clientCtxBuilder[Req, Resp]) WithStreaming() *clientCtxBuilder[Req, Resp] {
-	b.c.streaming = true
-	b.chanMultiplier = 10
-	return b
-}
-
-// WithWaitSendDone configures the clientCtx to wait for send completion.
-// Used by multicast calls to ensure messages are sent before returning.
-func (b *clientCtxBuilder[Req, Resp]) WithWaitSendDone(waitSendDone bool) *clientCtxBuilder[Req, Resp] {
-	b.c.waitSendDone = waitSendDone
-	return b
-}
-
-// Build finalizes the ClientCtx configuration and returns the constructed instance.
-// It creates the metadata and reply channel, and sets up the appropriate response iterator.
-func (b *clientCtxBuilder[Req, Resp]) Build() *ClientCtx[Req, Resp] {
-	// Assign a unique message ID and create the reply channel at build time.
-	b.c.msgID = b.c.config.nextMsgID()
-	b.c.replyChan = make(chan NodeResponse[*stream.Message], b.c.config.Size()*b.chanMultiplier)
-
-	if b.c.streaming {
-		b.c.responseSeq = b.c.streamingResponseSeq()
+	if clientCtx.streaming {
+		clientCtx.responseSeq = clientCtx.streamingResponseSeq()
 	} else {
-		b.c.responseSeq = b.c.defaultResponseSeq()
+		clientCtx.responseSeq = clientCtx.defaultResponseSeq()
 	}
-	return b.c
+	clientCtx.applyInterceptors(opts.interceptors)
+	return clientCtx
+}
+
+// chanSize returns the channel buffer size based on the configuration and
+// whether the call is streaming. For streaming calls, we use a larger buffer
+// to accommodate more in-flight messages without blocking.
+func chanSize(config Configuration, streaming bool) int {
+	if streaming {
+		return config.Size() * 10
+	}
+	return config.Size()
 }
 
 // -------------------------------------------------------------------------
@@ -176,28 +168,44 @@ func (c *ClientCtx[Req, Resp]) applyInterceptors(interceptors []any) {
 	c.responseSeq = responseSeq
 }
 
-// send dispatches requests to all nodes, applying any registered transformations.
-// It ensures that exactly one response (success or error) is sent per node on replyChan.
+// send dispatches requests to all nodes. It delegates to sendWithPerNodeTransformation
+// if any per-node request transformations are registered. Otherwise, it uses sendShared
+// to marshal the request once and send the same message to all nodes.
 func (c *ClientCtx[Req, Resp]) send() {
-	var sharedMsg *stream.Message
 	if len(c.reqTransforms) == 0 {
-		// Fast path: marshal once when no per-node transforms are registered.
-		var err error
-		sharedMsg, err = stream.NewMessage(c.Context, c.msgID, c.method, c.request)
-		if err != nil {
-			// Marshaling fails identically for all nodes; report and return.
-			for _, n := range c.config {
-				c.replyChan <- NodeResponse[*stream.Message]{NodeID: n.ID(), Err: err}
-			}
-			return
+		c.sendShared()
+	} else {
+		c.sendWithPerNodeTransformation()
+	}
+}
+
+// sendShared marshals the request once and enqueues the shared message to all nodes.
+// On marshal error, it reports the error to every node and returns early.
+func (c *ClientCtx[Req, Resp]) sendShared() {
+	sharedMsg, err := stream.NewMessage(c.Context, c.msgID, c.method, c.request)
+	if err != nil {
+		// Marshaling fails identically for all nodes; report and return.
+		for _, n := range c.config {
+			c.replyChan <- NodeResponse[*stream.Message]{NodeID: n.ID(), Err: err}
 		}
+		return
 	}
 	for _, n := range c.config {
-		// transform only if there are registered transforms; otherwise reuse the shared message
-		streamMsg := sharedMsg
-		if streamMsg == nil {
-			streamMsg = c.transformAndMarshal(n)
-		}
+		n.Enqueue(stream.Request{
+			Ctx:          c.Context,
+			Msg:          sharedMsg,
+			Streaming:    c.streaming,
+			WaitSendDone: c.waitSendDone,
+			ResponseChan: c.replyChan,
+		})
+	}
+}
+
+// sendWithPerNodeTransformation applies per-node request transformations before
+// marshaling and enqueues each individually transformed message to its node.
+func (c *ClientCtx[Req, Resp]) sendWithPerNodeTransformation() {
+	for _, n := range c.config {
+		streamMsg := c.transformAndMarshal(n)
 		if streamMsg == nil {
 			continue // Skip node: transformAndMarshal already sent ErrSkipNode
 		}
@@ -215,16 +223,16 @@ func (c *ClientCtx[Req, Resp]) send() {
 // then marshals it into a stream.Message. Returns nil if transformation fails
 // or marshaling fails (in which case the error is sent on replyChan).
 func (c *ClientCtx[Req, Resp]) transformAndMarshal(n *Node) *stream.Message {
-	result := c.request
+	transformedRequest := c.request
 	for _, transform := range c.reqTransforms {
-		result = transform(result, n)
+		transformedRequest = transform(transformedRequest, n)
 	}
 	// Check if the result is valid
-	if protoReq, ok := any(result).(proto.Message); !ok || protoReq == nil || !protoReq.ProtoReflect().IsValid() {
+	if protoReq, ok := any(transformedRequest).(proto.Message); !ok || protoReq == nil || !protoReq.ProtoReflect().IsValid() {
 		c.replyChan <- NodeResponse[*stream.Message]{NodeID: n.ID(), Err: ErrSkipNode}
 		return nil
 	}
-	streamMsg, err := stream.NewMessage(c.Context, c.msgID, c.method, result)
+	streamMsg, err := stream.NewMessage(c.Context, c.msgID, c.method, transformedRequest)
 	if err != nil {
 		c.replyChan <- NodeResponse[*stream.Message]{NodeID: n.ID(), Err: err}
 		return nil
@@ -237,7 +245,7 @@ func (c *ClientCtx[Req, Resp]) transformAndMarshal(n *Node) *stream.Message {
 func (c *ClientCtx[Req, Resp]) defaultResponseSeq() ResponseSeq[Resp] {
 	return func(yield func(NodeResponse[Resp]) bool) {
 		// Trigger sending on first iteration
-		c.sendOnce.Do(c.send)
+		c.sendNow()
 		for range c.Size() {
 			select {
 			case r := <-c.replyChan:
@@ -257,7 +265,7 @@ func (c *ClientCtx[Req, Resp]) defaultResponseSeq() ResponseSeq[Resp] {
 func (c *ClientCtx[Req, Resp]) streamingResponseSeq() ResponseSeq[Resp] {
 	return func(yield func(NodeResponse[Resp]) bool) {
 		// Trigger sending on first iteration
-		c.sendOnce.Do(c.send)
+		c.sendNow()
 		for {
 			select {
 			case r := <-c.replyChan:

@@ -5,10 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 )
 
-// ConfigContext is a context that carries a configuration for quorum calls.
-// It embeds context.Context and provides access to the Configuration.
+// Configuration represents a static set of nodes on which multicast or
+// quorum calls may be invoked. A configuration is created using [NewConfig].
+// A configuration should be treated as immutable. Therefore, methods that
+// operate on a configuration always return a new Configuration instance.
+type Configuration []*Node
+
+// ConfigContext is a context that carries a configuration for multicast or
+// quorum calls. It embeds context.Context and provides access to the configuration.
 //
 // Use [Configuration.Context] to create a ConfigContext from an existing context.
 type ConfigContext struct {
@@ -16,84 +23,56 @@ type ConfigContext struct {
 	cfg Configuration
 }
 
-// Configuration returns the Configuration associated with this context.
+// Configuration returns the configuration associated with this context.
 func (c ConfigContext) Configuration() Configuration {
 	return c.cfg
 }
-
-// Configuration represents a static set of nodes on which quorum calls may be invoked.
-// A configuration is created using [NewConfiguration] or [NewConfig]. A configuration
-// should be treated as immutable. Therefore, methods that operate on a configuration
-// always return a new Configuration instance.
-type Configuration []*Node
 
 // Context creates a new ConfigContext from the given parent context
 // and this configuration.
 //
 // Example:
 //
-//	config, _ := gorums.NewConfiguration(mgr, gorums.WithNodeList(addrs))
+//	config, _ := gorums.NewConfig(gorums.WithNodeList(addrs), dialOpts...)
 //	cfgCtx := config.Context(context.Background())
 //	resp, err := paxos.Prepare(cfgCtx, req)
 func (c Configuration) Context(parent context.Context) *ConfigContext {
 	if len(c) == 0 {
-		panic("gorums: Context called with empty configuration")
+		panic("gorums: Context called on an empty configuration")
 	}
 	return &ConfigContext{Context: parent, cfg: c}
 }
 
-// NewConfiguration returns a configuration based on the provided list of nodes.
-// Nodes can be supplied using WithNodes or WithNodeList.
-// A new configuration can also be created from an existing configuration
-// using the Add, Union, Remove, Difference, Extend, and WithoutErrors methods.
-func NewConfiguration(mgr *Manager, opt NodeListOption) (nodes Configuration, err error) {
-	if opt == nil {
-		return nil, fmt.Errorf("config: missing required node list")
-	}
-	return opt.newConfig(mgr)
-}
-
-// NewConfig returns a new [Configuration] based on the provided [gorums.Option]s.
-// It accepts exactly one [gorums.NodeListOption] and multiple [gorums.ManagerOption]s.
-// You may use this function to create the initial configuration for a new manager.
+// NewConfig returns a new [Configuration] based on the provided nodes and dial options.
 //
 // Example:
 //
-//		cfg, err := NewConfig(
-//		    gorums.WithNodeList([]string{"localhost:8080", "localhost:8081", "localhost:8082"}),
-//	        gorums.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
-//		)
-//
-// This is a convenience function for creating a configuration without explicitly
-// creating a manager first. However, the manager can be accessed using the
-// [Configuration.Manager] method. This method should only be used once since it
-// creates a new manager; if a manager already exists, use [NewConfiguration]
-// instead, and provide the existing manager as the first argument.
-func NewConfig(opts ...Option) (Configuration, error) {
-	serverOptions, managerOptions, nodeListOption, err := splitOptions(opts)
+//	cfg, err := NewConfig(
+//	    gorums.WithNodeList([]string{"localhost:8080", "localhost:8081", "localhost:8082"}),
+//	    gorums.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
+//	)
+func NewConfig(nodes NodeListOption, opts ...DialOption) (Configuration, error) {
+	if nodes == nil {
+		return nil, fmt.Errorf("gorums: missing required node list")
+	}
+	mgr := newOutboundManager(opts...)
+	cfg, err := nodes.newConfig(mgr)
 	if err != nil {
+		_ = mgr.Close()
 		return nil, err
 	}
-	if len(serverOptions) > 0 {
-		return nil, fmt.Errorf("gorums: ServerOption not valid for NewConfig; pass it to NewSystem or NewLocalSystems instead")
-	}
-	if nodeListOption == nil {
-		return nil, fmt.Errorf("gorums: missing required NodeListOption")
-	}
-	mgr := NewManager(managerOptions...)
-	return NewConfiguration(mgr, nodeListOption)
+	return cfg, nil
 }
 
 // Extend returns a new Configuration combining c with new nodes from the provided NodeListOption.
-// This is the only way to add nodes that are not yet registered with the manager.
 func (c Configuration) Extend(opt NodeListOption) (Configuration, error) {
 	if len(c) == 0 {
-		return nil, fmt.Errorf("config: cannot extend empty configuration")
+		return nil, fmt.Errorf("gorums: cannot extend empty configuration")
 	}
 	if opt == nil {
 		return slices.Clone(c), nil
 	}
-	mgr := c.Manager()
+	mgr := c.mgr()
 	newNodes, err := opt.newConfig(mgr)
 	if err != nil {
 		return nil, err
@@ -133,13 +112,20 @@ func (c Configuration) Equal(b Configuration) bool {
 	return true
 }
 
-// Manager returns the Manager that manages this configuration's nodes.
-// Returns nil if the configuration is empty.
-func (c Configuration) Manager() *Manager {
+// mgr returns the outboundManager for this configuration's nodes.
+func (c Configuration) mgr() *outboundManager {
 	if len(c) == 0 {
 		return nil
 	}
 	return c[0].mgr
+}
+
+// Close closes all node connections managed by this configuration.
+func (c Configuration) Close() error {
+	if mgr := c.mgr(); mgr != nil {
+		return mgr.Close()
+	}
+	return nil
 }
 
 // nextMsgID returns the next message ID from this client's manager.
@@ -158,7 +144,7 @@ func (c Configuration) Add(ids ...uint32) Configuration {
 	if len(c) == 0 {
 		return nil
 	}
-	mgr := c.Manager()
+	mgr := c.mgr()
 	nodes := slices.Clone(c)
 	// seenIDs is used to filter duplicate IDs and IDs already added
 	seenIDs := newSet(c.NodeIDs()...)
@@ -170,7 +156,7 @@ func (c Configuration) Add(ids ...uint32) Configuration {
 			}
 		}
 	}
-	OrderedBy(ID).Sort(nodes)
+	slices.SortFunc(nodes, ID)
 	return nodes
 }
 
@@ -210,6 +196,99 @@ func (c Configuration) Difference(other Configuration) Configuration {
 		return slices.Clone(c)
 	}
 	return c.Remove(other.NodeIDs()...)
+}
+
+// SortBy returns a new Configuration with nodes ordered by the given comparator.
+// The original configuration is not modified.
+//
+// Use this with the built-in node comparator functions [ID], [LastNodeError],
+// and [Latency]:
+//
+//	fastest := cfg.SortBy(gorums.Latency)           // ascending by latency
+//	healthy := cfg.SortBy(gorums.LastNodeError)     // no-error nodes first
+//
+// Comparators can be combined for multi-key ordering:
+//
+//	cfg.SortBy(func(a, b *Node) int {
+//	    if r := gorums.LastNodeError(a, b); r != 0 {
+//	        return r
+//	    }
+//	    return gorums.Latency(a, b)
+//	})
+//
+// SortBy uses a stable sort, so nodes with equal comparator values retain
+// their original relative order.
+//
+// Note: quorum calls contact every node in the configuration regardless of
+// order. Sorting only affects which nodes are selected when the result is
+// sliced to a smaller subset, e.g., cfg.SortBy(gorums.Latency)[:quorumSize].
+// See the "Latency-Based Node Selection" section of the user guide for
+// guidance on sub-configuration sizing and re-sort frequency.
+func (c Configuration) SortBy(cmp func(*Node, *Node) int) Configuration {
+	if len(c) == 0 {
+		return nil
+	}
+	sorted := slices.Clone(c)
+	slices.SortStableFunc(sorted, cmp)
+	return sorted
+}
+
+// Watch starts a background goroutine that calls derive(c) every interval and
+// emits the result on the returned channel whenever it differs from the previous
+// result. The initial result is always emitted before the first tick, so callers
+// always receive a valid configuration immediately. The interval must be greater
+// than zero, and derive must be non-nil; otherwise, Watch will panic.
+//
+// The derive function receives the full configuration c and returns any derived
+// sub-configuration. Typical examples:
+//
+//	// Latency-based top-k subset:
+//	cfg.Watch(ctx, 5*time.Second, func(c gorums.Configuration) gorums.Configuration {
+//	    return c.SortBy(gorums.Latency)[:quorumSize]
+//	})
+//
+//	// Skip failed nodes first, then pick fastest:
+//	cfg.Watch(ctx, 5*time.Second, func(c gorums.Configuration) gorums.Configuration {
+//	    return c.WithoutErrors(lastErr).SortBy(gorums.Latency)[:quorumSize]
+//	})
+//
+// The returned channel has a buffer of 1. If the consumer is slow and has not
+// yet read the previous update, the goroutine skips the emission and waits for
+// the next tick to re-evaluate.
+//
+// The goroutine exits and the channel is closed when ctx is cancelled.
+func (c Configuration) Watch(ctx context.Context, interval time.Duration, derive func(Configuration) Configuration) <-chan Configuration {
+	if interval <= 0 {
+		panic("gorums: Watch interval must be positive")
+	}
+	if derive == nil {
+		panic("gorums: Watch derive function must be non-nil")
+	}
+	ch := make(chan Configuration, 1)
+	go func() {
+		defer close(ch)
+		current := derive(c)
+		ch <- current
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				fresh := derive(c)
+				if !fresh.Equal(current) {
+					current = fresh
+					select {
+					case ch <- current:
+					default: // consumer hasn't read yet; next tick will re-evaluate
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
 }
 
 // WithoutErrors returns a new Configuration excluding nodes that failed in the

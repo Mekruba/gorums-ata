@@ -10,7 +10,6 @@ import (
 // NodeListOption must be implemented by node providers. It is used by both the
 // Manager (outbound) and by inboundManager (inbound) via newConfig.
 type NodeListOption interface {
-	Option
 	newConfig(nodeRegistry) (Configuration, error)
 }
 
@@ -35,11 +34,9 @@ func WithNodes[T NodeAddress](nodes map[uint32]T) NodeListOption {
 
 type nodeMap[T NodeAddress] map[uint32]T
 
-func (nodeMap[T]) isOption() {}
-
 func (nm nodeMap[T]) newConfig(registry nodeRegistry) (Configuration, error) {
 	if len(nm) == 0 {
-		return nil, fmt.Errorf("config: missing required node map")
+		return nil, fmt.Errorf("gorums: missing required node map")
 	}
 	builder := newNodeBuilder(registry, len(nm))
 	// Sort IDs to ensure deterministic processing order
@@ -62,11 +59,9 @@ func WithNodeList(addrsList []string) NodeListOption {
 
 type nodeList []string
 
-func (nodeList) isOption() {}
-
 func (nl nodeList) newConfig(registry nodeRegistry) (Configuration, error) {
 	if len(nl) == 0 {
-		return nil, fmt.Errorf("config: missing required node addresses")
+		return nil, fmt.Errorf("gorums: missing required node addresses")
 	}
 	builder := newNodeBuilder(registry, len(nl))
 	nextID := builder.nextID()
@@ -113,17 +108,17 @@ func newNodeBuilder(registry nodeRegistry, capacity int) *nodeBuilder {
 // add creates or reuses a node with the given ID and address.
 func (b *nodeBuilder) add(id uint32, addr string) error {
 	if id == 0 {
-		return fmt.Errorf("config: node 0 is reserved")
+		return fmt.Errorf("gorums: node 0 is reserved")
 	}
 	normalizedAddr, err := normalizeAddr(addr)
 	if err != nil {
-		return fmt.Errorf("config: invalid address %q: %w", addr, err)
+		return fmt.Errorf("gorums: invalid address %q: %w", addr, err)
 	}
 
 	// If ID already exists, verify address matches
 	if existingNode, found := b.idToNode[id]; found {
 		if existingNode.Address() != normalizedAddr {
-			return fmt.Errorf("config: node %d already in use by %q", id, existingNode.Address())
+			return fmt.Errorf("gorums: node %d already in use by %q", id, existingNode.Address())
 		}
 		b.nodes = append(b.nodes, existingNode)
 		return nil
@@ -131,7 +126,7 @@ func (b *nodeBuilder) add(id uint32, addr string) error {
 
 	// Check for duplicate address
 	if existingID, exists := b.addrToID[normalizedAddr]; exists {
-		return fmt.Errorf("config: address %q already in use by node %d", normalizedAddr, existingID)
+		return fmt.Errorf("gorums: address %q already in use by node %d", normalizedAddr, existingID)
 	}
 
 	b.addrToID[normalizedAddr] = id
@@ -145,7 +140,7 @@ func (b *nodeBuilder) add(id uint32, addr string) error {
 
 // configuration returns the built Configuration, sorted by ID.
 func (b *nodeBuilder) configuration() Configuration {
-	OrderedBy(ID).Sort(b.nodes)
+	slices.SortFunc(b.nodes, ID)
 	return b.nodes
 }
 

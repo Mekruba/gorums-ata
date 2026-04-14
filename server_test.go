@@ -3,6 +3,7 @@ package gorums_test
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,9 +25,9 @@ func TestServerCallback(t *testing.T) {
 		message = m.Get("message")[0]
 		signal <- struct{}{}
 	})
-	mgrOption := gorums.WithMetadata(metadata.New(map[string]string{"message": "hello"}))
+	dialOption := gorums.WithMetadata(metadata.New(map[string]string{"message": "hello"}))
 
-	gorums.TestNode(t, nil, srvOption, mgrOption)
+	gorums.TestNode(t, nil, srvOption, dialOption)
 
 	select {
 	case <-time.After(100 * time.Millisecond):
@@ -103,6 +104,45 @@ func TestServerInterceptorsChain(t *testing.T) {
 	}
 }
 
+// TestWithBufferSizesProcessesRequests verifies that WithBufferSizes is accepted by
+// NewServer and that the server correctly processes concurrent requests for each
+// combination of receive and send buffer sizes, including the zero (unbuffered) case.
+func TestWithBufferSizesProcessesRequests(t *testing.T) {
+	const concurrency = 16
+	tests := []struct {
+		name     string
+		recvSize uint
+		sendSize uint
+	}{
+		{name: "unbuffered", recvSize: 0, sendSize: 0},
+		{name: "recv-only", recvSize: 1, sendSize: 0},
+		{name: "send-only", recvSize: 0, sendSize: 1},
+		{name: "both-buffered", recvSize: concurrency, sendSize: concurrency},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := gorums.TestNode(t, nil, gorums.WithBufferSizes(tt.recvSize, tt.sendSize))
+			ctx := gorums.TestContext(t, 5*time.Second)
+
+			var wg sync.WaitGroup
+			errs := make([]error, concurrency)
+			for i := range concurrency {
+				wg.Go(func() {
+					nodeCtx := node.Context(ctx)
+					_, errs[i] = gorums.RPCCall[*pb.StringValue, *pb.StringValue](nodeCtx, pb.String(""), mock.TestMethod)
+				})
+			}
+			wg.Wait()
+
+			for i, err := range errs {
+				if err != nil {
+					t.Errorf("request %d failed: %v", i, err)
+				}
+			}
+		})
+	}
+}
+
 // TestTCPReconnection verifies that a node can reconnect after the
 // underlying TCP connection is broken.
 func TestTCPReconnection(t *testing.T) {
@@ -122,13 +162,11 @@ func TestTCPReconnection(t *testing.T) {
 		_ = srv.Serve(lis)
 	}()
 
-	mgr := gorums.NewManager(gorums.InsecureDialOptions(t))
-	t.Cleanup(gorums.Closer(t, mgr))
-
-	cfg, err := gorums.NewConfiguration(mgr, gorums.WithNodeList([]string{addr}))
+	cfg, err := gorums.NewConfig(gorums.WithNodeList([]string{addr}), gorums.InsecureDialOptions(t))
 	if err != nil {
-		t.Fatalf("NewConfiguration failed: %v", err)
+		t.Fatalf("NewConfig failed: %v", err)
 	}
+	t.Cleanup(gorums.Closer(t, cfg))
 	node := cfg.Nodes()[0]
 
 	// Send first message

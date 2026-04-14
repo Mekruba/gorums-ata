@@ -2,37 +2,34 @@ package gorums
 
 import "testing"
 
-// TestOption is a marker interface that can hold ManagerOption,
+// TestOption is a marker interface that can hold DialOption,
 // ServerOption, or NodeListOption. This allows test helpers to accept
 // a single variadic parameter that can be filtered and passed to the
-// appropriate constructors (NewManager, NewServer, NewConfiguration).
+// appropriate constructors: NewServer or NewConfig.
 //
-// Each option type (ManagerOption, ServerOption, NodeListOption) embeds
+// Each option type (DialOption, ServerOption, NodeListOption) embeds
 // this interface, so they can be passed directly without wrapping:
 //
 //	SetupConfiguration(t, 3, nil,
-//		WithBackoff(...),           // ManagerOption
-//		WithReceiveBufferSize(10),  // ServerOption
+//		WithBackoff(...),           // DialOption
+//		WithBufferSizes(10, 10),    // ServerOption
 //		WithNodeMap(...),           // NodeListOption
 //	)
 type TestOption any
 
 // testOptions holds extracted options from a slice of TestOption.
 type testOptions struct {
-	managerOpts    []ManagerOption
+	managerOpts    []DialOption
 	serverOpts     []ServerOption
 	nodeListOpts   []NodeListOption
-	existingMgr    *Manager
 	stopFuncPtr    *func(...int)       // pointer to capture the variadic stop function
 	preConnectHook func(stopFn func()) // called before connecting to servers
 	skipGoleak     bool                // skip goleak checks (useful for synctest)
 }
 
 // shouldSkipGoleak returns true if goleak checks should be skipped.
-// This includes cases where an existing manager is reused (since it may
-// already have its own goleak checks) or when SkipGoleak option is set.
 func (to *testOptions) shouldSkipGoleak() bool {
-	return to.existingMgr != nil || to.skipGoleak
+	return to.skipGoleak
 }
 
 // serverFunc returns a server creation function based on the server options.
@@ -49,7 +46,7 @@ func (to *testOptions) serverFunc(srvFn func(i int) ServerIface) func(i int) Ser
 	}
 	if len(to.serverOpts) > 0 {
 		// You need to pass nil as the server function to use server options with the default server
-		panic("gorums: cannot use server options with a custom server function; use nil to use the default test server")
+		panic("gorums: cannot use server options with a custom server function")
 	}
 	return srvFn
 }
@@ -70,14 +67,12 @@ func extractTestOptions(opts []TestOption) testOptions {
 	var result testOptions
 	for _, opt := range opts {
 		switch o := opt.(type) {
-		case ManagerOption:
+		case DialOption:
 			result.managerOpts = append(result.managerOpts, o)
 		case ServerOption:
 			result.serverOpts = append(result.serverOpts, o)
 		case NodeListOption:
 			result.nodeListOpts = append(result.nodeListOpts, o)
-		case *Manager:
-			result.existingMgr = o
 		case stopFuncProvider:
 			result.stopFuncPtr = o.stopFunc
 		case preConnectProvider:
@@ -87,21 +82,6 @@ func extractTestOptions(opts []TestOption) testOptions {
 		}
 	}
 	return result
-}
-
-// WithManager returns a TestOption that provides an existing manager to use
-// instead of creating a new one. This is useful when creating multiple
-// configurations that should share the same manager.
-//
-// When using WithManager, the caller is responsible for closing the manager.
-// SetupConfiguration will NOT register a cleanup function for the manager.
-//
-// This option is intended for testing purposes only.
-func WithManager(_ testing.TB, mgr *Manager) TestOption {
-	if mgr == nil {
-		panic("gorums: WithManager called with nil manager")
-	}
-	return mgr
 }
 
 // stopFuncProvider is a TestOption that captures the server stop function.
@@ -127,7 +107,7 @@ type stopFuncProvider struct {
 // This option is intended for testing purposes only.
 func WithStopFunc(_ testing.TB, fn *func(...int)) TestOption {
 	if fn == nil {
-		panic("gorums: WithStopFunc called with nil pointer")
+		panic("gorums: WithStopFunc called with nil function pointer")
 	}
 	return stopFuncProvider{stopFunc: fn}
 }
