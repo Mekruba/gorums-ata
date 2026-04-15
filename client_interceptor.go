@@ -7,6 +7,7 @@ import (
 
 	"github.com/relab/gorums/internal/stream"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 // QuorumInterceptor intercepts and processes quorum calls, allowing modification of
@@ -55,8 +56,8 @@ type ClientCtx[Req, Resp msg] struct {
 	// streaming indicates whether this is a streaming call (for correctable streams).
 	streaming bool
 
-	// waitSendDone indicates whether the caller waits for send completion (for multicast).
-	waitSendDone bool
+	// oneway indicates whether this is a one-way call (for multicast).
+	oneway bool
 
 	// sendOnce ensures messages are sent exactly once, on the first
 	// call to Responses(). This deferred sending allows interceptors
@@ -69,50 +70,65 @@ func (c *ClientCtx[Req, Resp]) sendNow() {
 	c.sendOnce.Do(c.send)
 }
 
-type clientCtxOptions struct {
-	streaming    bool
-	waitSendDone bool
-	interceptors []any
-}
-
-// newClientCtx constructs and initializes a ClientCtx for quorum-style calls.
-// It creates call metadata, configures the response iterator, and applies
-// interceptors after the base iterator has been established.
-func newClientCtx[Req, Resp msg](
+// newQuorumCallClientCtx constructs a ClientCtx for quorum calls (two-way, always returns responses).
+// A reply channel is always created; streaming controls both its buffer size and the response iterator type.
+func newQuorumCallClientCtx[Req, Resp msg](
 	ctx *ConfigContext,
 	req Req,
 	method string,
-	opts clientCtxOptions,
+	streaming bool,
+	interceptors []any,
 ) *ClientCtx[Req, Resp] {
 	config := ctx.Configuration()
-	clientCtx := &ClientCtx[Req, Resp]{
-		Context:      ctx,
-		config:       config,
-		request:      req,
-		method:       method,
-		msgID:        config.nextMsgID(),
-		replyChan:    make(chan NodeResponse[*stream.Message], chanSize(config, opts.streaming)),
-		streaming:    opts.streaming,
-		waitSendDone: opts.waitSendDone,
+	n := config.Size()
+	if streaming {
+		n *= 10
 	}
-
-	if clientCtx.streaming {
+	clientCtx := &ClientCtx[Req, Resp]{
+		Context:   ctx,
+		config:    config,
+		request:   req,
+		method:    method,
+		msgID:     config.nextMsgID(),
+		streaming: streaming,
+		replyChan: make(chan NodeResponse[*stream.Message], n),
+	}
+	if streaming {
 		clientCtx.responseSeq = clientCtx.streamingResponseSeq()
 	} else {
 		clientCtx.responseSeq = clientCtx.defaultResponseSeq()
 	}
-	clientCtx.applyInterceptors(opts.interceptors)
+	clientCtx.applyInterceptors(interceptors)
 	return clientCtx
 }
 
-// chanSize returns the channel buffer size based on the configuration and
-// whether the call is streaming. For streaming calls, we use a larger buffer
-// to accommodate more in-flight messages without blocking.
-func chanSize(config Configuration, streaming bool) int {
-	if streaming {
-		return config.Size() * 10
+// newMulticastClientCtx constructs a ClientCtx for multicast (one-way, no responses).
+// A reply channel is created only when waitForSend=true (blocking send); fire-and-forget
+// calls receive a nil channel, meaning no router entry is registered.
+func newMulticastClientCtx[Req msg](
+	ctx *ConfigContext,
+	req Req,
+	method string,
+	waitForSend bool,
+	interceptors []any,
+) *ClientCtx[Req, *emptypb.Empty] {
+	config := ctx.Configuration()
+	var replyChan chan NodeResponse[*stream.Message]
+	if waitForSend {
+		replyChan = make(chan NodeResponse[*stream.Message], config.Size())
 	}
-	return config.Size()
+	clientCtx := &ClientCtx[Req, *emptypb.Empty]{
+		Context:   ctx,
+		config:    config,
+		request:   req,
+		method:    method,
+		msgID:     config.nextMsgID(),
+		oneway:    true,
+		replyChan: replyChan,
+	}
+	clientCtx.responseSeq = clientCtx.defaultResponseSeq()
+	clientCtx.applyInterceptors(interceptors)
+	return clientCtx
 }
 
 // -------------------------------------------------------------------------
@@ -156,6 +172,26 @@ func (c *ClientCtx[Req, Resp]) Size() int {
 	return c.config.Size()
 }
 
+// reportNodeError sends an error response for the given node to replyChan.
+// It is a no-op for fire-and-forget calls where replyChan is nil.
+func (c *ClientCtx[Req, Resp]) reportNodeError(nodeID uint32, err error) {
+	if c.replyChan != nil {
+		c.replyChan <- NodeResponse[*stream.Message]{NodeID: nodeID, Err: err}
+	}
+}
+
+// enqueue sends a stream.Request to the given node, populating the shared
+// fields from ClientCtx so call sites only need to supply the message.
+func (c *ClientCtx[Req, Resp]) enqueue(n *Node, msg *stream.Message) {
+	n.Enqueue(stream.Request{
+		Ctx:          c.Context,
+		Msg:          msg,
+		Streaming:    c.streaming,
+		Oneway:       c.oneway,
+		ResponseChan: c.replyChan,
+	})
+}
+
 // applyInterceptors chains the given interceptors, wrapping the response sequence.
 // Each interceptor receives the current response sequence and returns a new one.
 // Interceptors are applied in order, with each wrapping the previous result.
@@ -186,18 +222,12 @@ func (c *ClientCtx[Req, Resp]) sendShared() {
 	if err != nil {
 		// Marshaling fails identically for all nodes; report and return.
 		for _, n := range c.config {
-			c.replyChan <- NodeResponse[*stream.Message]{NodeID: n.ID(), Err: err}
+			c.reportNodeError(n.ID(), err)
 		}
 		return
 	}
 	for _, n := range c.config {
-		n.Enqueue(stream.Request{
-			Ctx:          c.Context,
-			Msg:          sharedMsg,
-			Streaming:    c.streaming,
-			WaitSendDone: c.waitSendDone,
-			ResponseChan: c.replyChan,
-		})
+		c.enqueue(n, sharedMsg)
 	}
 }
 
@@ -209,19 +239,13 @@ func (c *ClientCtx[Req, Resp]) sendWithPerNodeTransformation() {
 		if streamMsg == nil {
 			continue // Skip node: transformAndMarshal already sent ErrSkipNode
 		}
-		n.Enqueue(stream.Request{
-			Ctx:          c.Context,
-			Msg:          streamMsg,
-			Streaming:    c.streaming,
-			WaitSendDone: c.waitSendDone,
-			ResponseChan: c.replyChan,
-		})
+		c.enqueue(n, streamMsg)
 	}
 }
 
 // transformAndMarshal applies transformations to the request for the given node,
 // then marshals it into a stream.Message. Returns nil if transformation fails
-// or marshaling fails (in which case the error is sent on replyChan).
+// or marshaling fails (in which case the error is reported via reportNodeError).
 func (c *ClientCtx[Req, Resp]) transformAndMarshal(n *Node) *stream.Message {
 	transformedRequest := c.request
 	for _, transform := range c.reqTransforms {
@@ -229,12 +253,12 @@ func (c *ClientCtx[Req, Resp]) transformAndMarshal(n *Node) *stream.Message {
 	}
 	// Check if the result is valid
 	if protoReq, ok := any(transformedRequest).(proto.Message); !ok || protoReq == nil || !protoReq.ProtoReflect().IsValid() {
-		c.replyChan <- NodeResponse[*stream.Message]{NodeID: n.ID(), Err: ErrSkipNode}
+		c.reportNodeError(n.ID(), ErrSkipNode)
 		return nil
 	}
 	streamMsg, err := stream.NewMessage(c.Context, c.msgID, c.method, transformedRequest)
 	if err != nil {
-		c.replyChan <- NodeResponse[*stream.Message]{NodeID: n.ID(), Err: err}
+		c.reportNodeError(n.ID(), err)
 		return nil
 	}
 	return streamMsg
