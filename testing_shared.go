@@ -40,26 +40,38 @@ func TestContext(t testing.TB, timeout time.Duration) context.Context {
 	return ctx
 }
 
+// TestWaitUntil polls predicate until it returns true or timeout elapses.
+// It returns true when predicate succeeds within timeout, and false otherwise.
+func TestWaitUntil(t testing.TB, timeout time.Duration, predicate func() bool) bool {
+	t.Helper()
+
+	if predicate() {
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), timeout)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return predicate()
+		case <-ticker.C:
+			if predicate() {
+				return true
+			}
+		}
+	}
+}
+
 // InsecureDialOptions returns a DialOption with insecure transport credentials
 // for testing.
 func InsecureDialOptions(_ testing.TB) DialOption {
 	return WithDialOptions(
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
-}
-
-// WaitForConfigCondition polls the config function until the condition cond returns true
-// or the timeout elapses. This is useful for waiting on dynamic config updates.
-func WaitForConfigCondition(t testing.TB, config func() Configuration, cond func(Configuration) bool) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if cond(config()) {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Errorf("timeout waiting for config; got %v", config().NodeIDs())
 }
 
 // TestQuorumCallError creates a QuorumCallError for testing.

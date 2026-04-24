@@ -70,16 +70,19 @@ func metadataWithNodeID(id uint32) metadata.MD {
 // inboundManager is safe for concurrent use.
 type inboundManager struct {
 	mu             sync.RWMutex
-	myID           uint32                   // this server's own NodeID; always present in inboundCfg
-	nodes          map[uint32]*Node          // pre-created for known peers; client peers added on connect
-	config         Configuration            // auto-updated slice of known peer servers, sorted by ID
-	clientConfig   Configuration            // auto-updated slice of client peers, sorted by ID
-	nextMsgID      atomic.Uint64            // counter for server-initiated message IDs
-	sendBufferSize uint                     // send buffer size for inbound channels
-	handler        stream.RequestHandler    // handler for dispatching incoming requests on all inbound nodes
-	onConfigChange func(Configuration)      // optional; called after each known-peer config change
-	nextClientID   uint32                   // next ID to assign to a client peer
+	myID           uint32                      // this server's own NodeID; always present in inboundCfg
+	nodes          map[uint32]*Node            // pre-created for known peers; client peers added on connect
+	config         Configuration               // auto-updated slice of known peer servers, sorted by ID
+	clientConfig   Configuration               // auto-updated slice of client peers, sorted by ID
+	nextMsgID      atomic.Uint64               // counter for server-initiated message IDs
+	sendBufferSize uint                        // send buffer size for inbound channels
+	handler        stream.RequestHandler       // handler for dispatching incoming requests on all inbound nodes
+	onConfigChange func(Configuration)         // optional; called after each known-peer config change
+	nextClientID   uint32                      // next ID to assign to a client peer
 	pubKeys        map[uint32]crypto.PublicKey // expected TLS public key per known peer node ID; nil means no cert verification
+	configCh       chan struct{}               // closed and replaced on each config/clientConfig change; protected by mu
+	stopCh         chan struct{}               // closed on shutdown to unblock waiters; never replaced
+	stopOnce       sync.Once                   // ensures stopCh is closed exactly once
 }
 
 // clientIDStart is the starting ID for dynamically assigned client peers.
@@ -106,6 +109,8 @@ func newInboundManager(myID uint32, opt NodeListOption, sendBuffer uint, onConfi
 		onConfigChange: onConfigChange,
 		nextClientID:   clientIDStart,
 		pubKeys:        pubKeys,
+		configCh:       make(chan struct{}),
+		stopCh:         make(chan struct{}),
 	}
 	if opt != nil {
 		if _, err := opt.newConfig(im); err != nil {
@@ -315,13 +320,73 @@ func (im *inboundManager) rebuildConfig() {
 			}
 		}
 	}
-	OrderedBy(ID).Sort(cfg)
-	OrderedBy(ID).Sort(clientCfg)
+	slices.SortFunc(cfg, ID)
+	slices.SortFunc(clientCfg, ID)
+	cfgChanged := !slices.Equal(im.config, cfg)
 	im.config = cfg
 	im.clientConfig = clientCfg
-	if im.onConfigChange != nil {
+	if cfgChanged && im.onConfigChange != nil {
 		im.onConfigChange(cfg)
 	}
+	// Broadcast config change to all waiters.
+	close(im.configCh)
+	im.configCh = make(chan struct{})
+}
+
+// checkConfig checks the condition under the read lock and returns the
+// current broadcast channel if the condition is not yet met.
+func (im *inboundManager) checkConfig(cond func() bool) (met bool, ch <-chan struct{}) {
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	if cond() {
+		return true, nil
+	}
+	return false, im.configCh
+}
+
+// waitForConfig blocks until cond returns true or until ctx is cancelled
+// or the inboundManager is closed. The cond function is called while the
+// read lock is held, so it must not acquire any additional locks.
+func (im *inboundManager) waitForConfig(ctx context.Context, cond func() bool) error {
+	for {
+		met, ch := im.checkConfig(cond)
+		if met {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-im.stopCh:
+			return ErrStopped
+		case <-ch:
+		}
+	}
+}
+
+// waitForKnownConfig blocks until cond returns true for the current known-peer
+// [Configuration], or until ctx is cancelled or the server is stopped.
+// The cond function receives the current known-peer configuration and must not
+// acquire any additional locks.
+func (im *inboundManager) waitForKnownConfig(ctx context.Context, cond func(Configuration) bool) error {
+	return im.waitForConfig(ctx, func() bool {
+		return cond(im.config)
+	})
+}
+
+// waitForClientConfig blocks until cond returns true for the current client-peer
+// [Configuration], or until ctx is cancelled or the server is stopped.
+// The cond function receives the current client-peer configuration and must not
+// acquire any additional locks.
+func (im *inboundManager) waitForClientConfig(ctx context.Context, cond func(Configuration) bool) error {
+	return im.waitForConfig(ctx, func() bool {
+		return cond(im.clientConfig)
+	})
+}
+
+// close signals all waiters to stop and prevents new waits from blocking.
+// Called from [System.Stop].
+func (im *inboundManager) close() {
+	im.stopOnce.Do(func() { close(im.stopCh) })
 }
 
 // nilPeerNode implements [stream.PeerNode] for regular clients that have no

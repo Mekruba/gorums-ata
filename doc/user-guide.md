@@ -173,6 +173,9 @@ message WriteRequest {
 
 For the `unicast` and `multicast` call types, the response message type will be unused by Gorums.
 
+> **Reserved message names:** The following names are reserved by Gorums and cannot be used as proto message type names in your `.proto` files: `Configuration`, `Node`, `NodeContext`, `ConfigContext`.
+> Using any of these names will cause a compile error in the generated code because Gorums injects type aliases with these names into every generated `_gorums.pb.go` file.
+
 ### Compiling the Service Definition
 
 Next, we compile our service definition into Go code which includes:
@@ -482,9 +485,37 @@ reply, level, err := corr.Get()
 reply, level, err = corr.Get()
 ```
 
+### Send-Timing Model
+
+Understanding when messages are actually sent matters for ordering and for reasoning about concurrent calls.
+
+**Quorum calls are lazy.** Messages are not sent to nodes until the caller consumes the `*Responses[T]` object by calling a terminal method (`First`, `Majority`, `All`, `Threshold`) or by calling `.Results()` to begin iterating.
+This gives interceptors a chance to register per-node request transformations before any bytes go on the wire.
+
+**Async variants send immediately.** `AsyncFirst`, `AsyncMajority`, `AsyncAll`, and `AsyncThreshold` call `sendNow` synchronously before spawning the goroutine that awaits the threshold.
+This preserves message ordering when multiple async calls are issued in sequence:
+
+```go
+// Messages for both calls are enqueued in order before either goroutine runs.
+futA := WriteQC(cfgCtx, reqA).AsyncMajority()
+futB := WriteQC(cfgCtx, reqB).AsyncMajority()
+_, _ = futA.Get()
+_, _ = futB.Get()
+```
+
+**Multicast and unicast send immediately.** One-way calls do not return a `*Responses[T]` object, so there is no deferred consumption step; messages are enqueued as soon as the call is made.
+
+Summary:
+
+| Call type           | When messages are sent        |
+| ------------------- | ----------------------------- |
+| Quorum call (sync)  | On first consumption (lazy)   |
+| Quorum call (async) | Immediately, before goroutine |
+| Multicast / unicast | Immediately                   |
+
 ## Iterator-Based Custom Aggregation
 
-For complex aggregation logic beyond the built-in terminal methods, use the iterator API provided by `responses.Seq()`.
+For complex aggregation logic beyond the built-in terminal methods, use the iterator API provided by `responses.Results()`.
 The iterator yields responses progressively as they arrive, allowing custom decision-making logic.
 
 ### Basic Iterator Pattern
@@ -492,7 +523,7 @@ The iterator yields responses progressively as they arrive, allowing custom deci
 ```go
 func newestValue(responses *gorums.Responses[*ReadResponse]) (*ReadResponse, error) {
   var newest *ReadResponse
-  for resp := range responses.Seq() {
+  for resp := range responses.Results() {
     // resp.Value contains the response message (may be nil if resp.Err is set)
     // resp.Err contains any error from that node (nil if successful)
     // resp.NodeID contains the node identifier
@@ -519,14 +550,14 @@ reply, err := newestValue(ReadQC(cfgCtx, &ReadRequest{}))
 
 ### Iterator Helper Methods
 
-The `ResponseSeq[T]` type provides helper methods for common operations:
+The iterator returned by `.Results()` provides helper methods that can be chained before consuming the sequence:
 
 #### `IgnoreErrors()` - Skip Failed Responses
 
 ```go
 func countSuccessful(responses *gorums.Responses[*Response]) int {
   count := 0
-  for resp := range responses.Seq().IgnoreErrors() {
+  for resp := range responses.Results().IgnoreErrors() {
     count++
     // resp.Value is guaranteed to be non-nil
     // resp.Err is guaranteed to be nil
@@ -542,7 +573,7 @@ func validResponses(responses *gorums.Responses[*Response]) []*Response {
   var valid []*Response
 
   // Only include responses that pass validation
-  filtered := responses.Seq().Filter(func(nr gorums.NodeResponse[*Response]) bool {
+  filtered := responses.Results().Filter(func(nr gorums.NodeResponse[*Response]) bool {
     return nr.Err == nil && isValid(nr.Value)
   })
 
@@ -560,7 +591,7 @@ func majorityWrite(responses *gorums.Responses[*WriteResponse]) (*WriteResponse,
   majority := (responses.Size() + 1) / 2
 
   // Collect first 'majority' successful responses
-  replies := responses.Seq().IgnoreErrors().CollectN(majority)
+  replies := responses.Results().IgnoreErrors().CollectN(majority)
 
   if len(replies) < majority {
     return nil, gorums.ErrIncomplete
@@ -570,16 +601,42 @@ func majorityWrite(responses *gorums.Responses[*WriteResponse]) (*WriteResponse,
   return aggregateWrites(replies), nil
 }
 
-// CollectAll waits for all responses
-func allResponses(responses *gorums.Responses[*Response]) map[uint32]*Response {
-  return responses.Seq().CollectAll()
+// allSuccessful collects all successful responses; errored nodes are skipped.
+func allSuccessful(responses *gorums.Responses[*Response]) map[uint32]*Response {
+  return responses.Results().IgnoreErrors().CollectAll()
 }
 
-// Combine with IgnoreErrors to collect only successful responses
-func allSuccessful(responses *gorums.Responses[*Response]) map[uint32]*Response {
-  return responses.Seq().IgnoreErrors().CollectAll()
+// allResponses collects all responses; errored nodes are included with a zero value.
+// Only use this when you know all nodes will succeed or you handle zero values.
+func allResponses(responses *gorums.Responses[*Response]) map[uint32]*Response {
+  return responses.Results().CollectAll()
 }
 ```
+
+#### Per-Node Error Inspection
+
+`CollectN` and `CollectAll` return `map[uint32]Resp` and do not preserve errors.
+When you need the actual error from a specific node, range over the results sequence directly:
+
+```go
+func inspectPerNodeErrors(responses *gorums.Responses[*Response]) {
+  var errs []error
+  replies := make(map[uint32]*Response)
+
+  for result := range responses.Results() {
+    if result.Err != nil {
+      // result.NodeID identifies which node failed
+      errs = append(errs, fmt.Errorf("node %d: %w", result.NodeID, result.Err))
+      continue
+    }
+    replies[result.NodeID] = result.Value
+  }
+
+  // errs holds per-node failures; replies holds successful values
+}
+```
+
+Use `Results().IgnoreErrors()` or `Results().CollectAll()` when you do not need per-node error details.
 
 ### Complete Example: Storage Client with Custom Aggregation
 
@@ -624,7 +681,7 @@ func ExampleStorageClient() {
 // newestValue returns the response with the most recent timestamp
 func newestValue(responses *gorums.Responses[*ReadResponse]) (*ReadResponse, error) {
   var newest *ReadResponse
-  for resp := range responses.Seq() {
+  for resp := range responses.Results() {
     if resp.Err != nil {
       continue
     }
@@ -648,7 +705,7 @@ func fastQuorum(responses *gorums.Responses[*Response]) (*Response, error) {
   const threshold = 2
   count := 0
 
-  for resp := range responses.Seq().IgnoreErrors() {
+  for resp := range responses.Results().IgnoreErrors() {
     count++
     if count >= threshold {
       return resp.Value, nil  // Return immediately after threshold
@@ -785,7 +842,7 @@ When you need to handle errors from individual nodes explicitly:
 // Require all nodes to succeed
 func RequireAllSuccess(resp *gorums.Responses[*Response]) (*Response, error) {
   var first *Response
-  for r := range resp.Seq() {
+  for r := range resp.Results() {
     if r.Err != nil {
       return nil, r.Err  // Fail fast on any error
     }
@@ -1056,6 +1113,165 @@ func NoFooAllowedInterceptor[T interface{ GetKey() string }](ctx gorums.ServerCt
 }
 ```
 
+## Server Configuration Callbacks
+
+Two server options expose hooks that fire at connection or configuration change time.
+Both are passed to `gorums.NewServer` as `ServerOption` values.
+
+### WithConnectCallback
+
+`WithConnectCallback` registers a function called each time a node opens or reopens a stream to this server.
+
+**Signature:**
+
+```go
+gorums.WithConnectCallback(func(ctx context.Context) {})
+```
+
+**When it runs:** immediately after a new stream is accepted by the server, before any messages are processed on that stream.
+
+**What is available:** the `context.Context` is the gRPC stream context.
+`metadata.FromIncomingContext(ctx)` returns all key/value metadata pairs sent by the connecting client.
+`peer.FromContext(ctx)` (from `google.golang.org/grpc/peer`) returns the remote network address.
+
+**Safe side effects:** reading metadata, logging, writing to atomics, or signaling a channel.
+The callback runs synchronously during stream setup — keep it fast and do not call back into the `*gorums.Server`.
+
+#### Example: Logging Incoming Metadata
+
+The following example shows how a server can extract a custom `client-id` metadata value sent by each connecting node.
+This pattern is exercised in `server_test.go`.
+
+```go
+gorumsSrv := gorums.NewServer(
+    gorums.WithConnectCallback(func(ctx context.Context) {
+        md, ok := metadata.FromIncomingContext(ctx)
+        if !ok {
+            return
+        }
+        if vals := md.Get("client-id"); len(vals) > 0 {
+            log.Printf("peer connected, client-id=%s", vals[0])
+        }
+    }),
+)
+```
+
+The connecting client attaches the metadata with `WithMetadata`:
+
+```go
+config, err := gorums.NewConfig(
+    gorums.WithNodeList(addrs),
+    gorums.WithMetadata(metadata.New(map[string]string{"client-id": "replica-3"})),
+    gorums.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
+)
+```
+
+### WithConfig onChange Callback
+
+`WithConfig` accepts an optional `onChange func(gorums.Configuration)` variadic argument.
+The callback is called after every change to the known-peer configuration — that is, each time a pre-configured peer connects or disconnects.
+
+**Signature:**
+
+```go
+gorums.WithConfig(myNodeID, nodeListOption, func(cfg gorums.Configuration) { ... })
+```
+
+**When it runs:** after every change to the known-peer configuration.
+For peer connect/disconnect events, the callback runs inside the server's internal configuration lock, immediately after the configuration slice has been replaced.
+The callback also fires once during `NewServer` construction (with the initial configuration, which contains only the self-node when no peers have connected yet)); that initial construction-time call does **not** run under the internal configuration lock.
+
+**What is available:** a configuration of connected known peers, sorted by node ID.
+The self-node (this server's own ID) is always included regardless of connectivity.
+
+**Safe side effects:** signaling a channel, writing to an atomic, or copying the slice.
+For connect/disconnect-triggered callbacks, the callback is invoked while holding the internal lock, so it must **not** call `srv.Config()`, `ctx.Config()`, or any other method that acquires the same lock.
+Do not perform blocking or long-running work inside the callback, including during the initial construction-time call.
+
+#### Example: Reacting to Peer Membership Changes
+
+The following example shows how a server can wait until a quorum of peers is connected before beginning to serve requests.
+
+```go
+const quorumSize = 2 // majority for a three-node cluster, including self
+
+ready := make(chan struct{}, 1)
+
+gorumsSrv := gorums.NewServer(
+    gorums.WithConfig(myNodeID, gorums.WithNodeList(peerAddrs),
+        func(cfg gorums.Configuration) {
+            if len(cfg) >= quorumSize {
+                select {
+                case ready <- struct{}{}:
+                default:
+                }
+            }
+        },
+    ),
+)
+
+// Block until a quorum connects before accepting client requests.
+<-ready
+log.Println("quorum ready, starting to serve")
+```
+
+The self-node is always present in `cfg`, so a three-node cluster (`quorumSize = 2`) will fire the signal as soon as a single remote peer connects.
+
+## Waiting for Configuration
+
+`System.WaitForConfig` and `System.WaitForClientConfig` block until a condition on the configuration is satisfied, or until the context is cancelled or the system is stopped.
+They replace the need to poll `Config()` in a loop and eliminate the latency and CPU overhead of polling.
+
+```go
+// Block until all three known peers are connected.
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+if err := sys.WaitForConfig(ctx, func(cfg gorums.Configuration) bool {
+    return cfg.Size() == 3
+}); err != nil {
+    log.Fatal("peers did not connect in time:", err)
+}
+```
+
+The condition is checked immediately against the current configuration, so the call returns without blocking if the condition is already satisfied.
+
+### WaitForConfig
+
+`WaitForConfig` waits on the known-peer configuration — the set of pre-configured peers that have connected, plus the local node itself.
+Use this when you need a quorum of static cluster members to be present before beginning to serve requests.
+
+```go
+err := sys.WaitForConfig(ctx, func(cfg gorums.Configuration) bool {
+    return cfg.Size() >= quorumSize
+})
+```
+
+### WaitForClientConfig
+
+`WaitForClientConfig` waits on the client-peer configuration — the set of anonymous clients that have connected dynamically and are reachable for reverse-direction calls.
+Use this when a server should not proceed until a minimum number of clients have registered.
+
+```go
+err := sys.WaitForClientConfig(ctx, func(cfg gorums.Configuration) bool {
+    return cfg.Size() >= expectedClients
+})
+```
+
+### Return values
+
+| Condition                         | Return value        |
+| --------------------------------- | ------------------- |
+| `cond` returns `true`             | `nil`               |
+| `ctx` is cancelled or times out   | `ctx.Err()`         |
+| `sys.Stop()` called before `cond` | `gorums.ErrStopped` |
+
+### Relationship to `onChange`
+
+`WaitForConfig` and the `onChange` callback (see [WithConfig onChange Callback](#withconfig-onchange-callback)) serve complementary purposes.
+`onChange` is suited for reactive work that must happen synchronously on every configuration change — for example, triggering a leader election or updating an atomic counter.
+`WaitForConfig` is suited for startup synchronization — blocking until the cluster reaches a desired state before the application begins normal operation.
+Unlike `onChange`, `WaitForConfig` composes naturally with `context.WithTimeout` and `context.WithCancel`.
+
 ## Error Handling
 
 Gorums provides structured error types to help you understand and handle failures in quorum calls.
@@ -1248,6 +1464,194 @@ func ExampleConfigClient() {
 }
 ```
 
+## Latency-Based Node Selection
+
+Gorums tracks the round-trip latency to each node as an exponentially weighted
+moving average, accessible via `node.Latency()`.
+This section explains how to use that information to construct faster
+sub-configurations, and what to watch out for when doing so.
+
+### The Latency Comparator
+
+`gorums.Latency` is a comparator function compatible with `slices.SortFunc` and `Configuration.SortBy`.
+The comparator orders nodes ascending by their current latency estimates;
+nodes without any measurements (freshly created, never sent traffic) are sorted last.
+
+```go
+// Sort all nodes by ascending latency.
+sorted := cfg.SortBy(gorums.Latency)
+
+// Pick the two fastest nodes.
+fast2 := cfg.SortBy(gorums.Latency)[:2]
+```
+
+Comparators can be chained for multi-key ordering.
+For example, healthy nodes first, then by latency within each group:
+
+```go
+sorted := cfg.SortBy(func(a, b *gorums.Node) int {
+    if r := gorums.LastNodeError(a, b); r != 0 {
+        return r
+    }
+    return gorums.Latency(a, b)
+})
+```
+
+### Using a Smaller Fast Configuration
+
+The most practical use of latency-based selection is reducing the quorum size to the fastest subset of nodes.
+Sending to fewer nodes lowers tail latency without weakening correctness, as long as the subset still meets your quorum threshold.
+
+```go
+const n = 5  // total nodes
+const f = 2  // tolerated failures (n = 2f+1)
+quorumSize := n/2 + 1  // simple majority for crash-fault tolerance = 3
+
+// Re-derive the fast sub-configuration periodically (see guidance below).
+fastCfg := allNodesCfg.SortBy(gorums.Latency)[:quorumSize]
+fastCfgCtx := fastCfg.Context(ctx)
+
+reply, err := ReadQC(fastCfgCtx, &ReadRequest{Key: "x"}).Majority()
+```
+
+Combining with error-based filtering is straightforward: drop failed nodes
+first, then pick the fastest of those that remain:
+
+```go
+var qcErr gorums.QuorumCallError
+if errors.As(err, &qcErr) {
+    fastCfg = cfg.WithoutErrors(qcErr).SortBy(gorums.Latency)[:quorumSize]
+}
+```
+
+> **Note:** For quorum calls, all nodes in the configuration are contacted —
+> the ordering only matters when you slice the result to a subset.
+> Sorting a full configuration without slicing has no effect on call latency.
+
+### How Often to Re-Sort
+
+`SortBy` returns a snapshot of the ordering at one point in time.
+Latency measurements change as network conditions shift; the snapshot does not
+auto-update.
+
+As a rule of thumb:
+
+* **Every few seconds** is a reasonable re-sort interval for most deployments.
+  A periodic goroutine or a lazy re-sort at the start of each request batch
+  both work well.
+* **On every single call** is usually unnecessary and wastes allocations.
+  Each `SortBy` clones the node slice.
+* **After a failed quorum call**, always re-evaluate: a node that caused the
+  failure should be excluded via `WithoutErrors` before re-sorting.
+* **After a topology change** (node added or removed), derive the sub-configuration
+  from the new full configuration rather than sorting an outdated one.
+
+A simple periodic refresh pattern using `Configuration.Watch`:
+
+```go
+updates := allNodesCfg.Watch(ctx, 5*time.Second, func(c gorums.Configuration) gorums.Configuration {
+    return c.SortBy(gorums.Latency)[:quorumSize]
+})
+fastCfg := <-updates // initial snapshot, available before the first tick
+
+// In your request loop or a dedicated goroutine, consume updates as they arrive:
+for cfg := range updates {
+    fastCfg = cfg // ordering changed; start using the new snapshot
+}
+```
+
+`Watch` calls the derive function every five seconds and emits a new
+sub-configuration only when the result changes. The initial snapshot is sent
+immediately, so callers always receive a valid configuration without waiting
+for the first tick.
+
+### Combining Watch with Error Filtering
+
+To skip failed nodes on every periodic refresh, capture the most recent
+`gorums.QuorumCallError` in a mutex-guarded variable and include it in the
+derive function:
+
+```go
+var mu sync.Mutex
+var lastQCErr gorums.QuorumCallError // zero value excludes no nodes
+
+// After each failed quorum call, record the error so the next Watch tick
+// can exclude the offending nodes:
+//
+//   var qcErr gorums.QuorumCallError
+//   if errors.As(err, &qcErr) {
+//       mu.Lock(); lastQCErr = qcErr; mu.Unlock()
+//   }
+
+updates := allNodesCfg.Watch(ctx, 5*time.Second, func(c gorums.Configuration) gorums.Configuration {
+    mu.Lock()
+    qcErr := lastQCErr
+    mu.Unlock()
+    return c.WithoutErrors(qcErr).SortBy(gorums.Latency)[:quorumSize]
+})
+```
+
+The zero value of `gorums.QuorumCallError` carries no node errors, so the
+initial derive call behaves identically to the pure-latency example above.
+
+### Measurement Limits
+
+`Node.Latency()` has several limits that are worth understanding before building
+on it:
+
+* **No traffic → no measurement.** The estimate is only updated on successful
+  responses. A node that has never received a response returns a negative value.
+  `SortBy(gorums.Latency)` pushes such nodes to the end of the slice, so you
+  will not accidentally pick an unmeasured node when slicing the front.
+
+* **Staleness.** If traffic to a node stops, the estimate holds its last
+  observed value indefinitely.  A node that appeared fast previously will
+  continue to look fast until new responses arrive and update the average,
+  even if network conditions have since changed.
+
+* **Slow convergence.** The moving average uses a smoothing factor of 0.2, so
+  a sudden step-change in latency takes roughly five round trips to be reflected
+  in the estimate.  Short-lived spikes are smoothed away, which is usually
+  desirable but means the estimate lags behind rapid fluctuations.
+
+* **RPC compute time included.** The measurement covers the full round-trip
+  from sending the request to receiving the response.  For long-running RPCs,
+  server-side processing time is included in the estimate, which means the
+  measurement reflects more than just network latency.  In workloads dominated
+  by heavy RPCs, this can skew node selection toward nodes with lighter server
+  load rather than nodes that are genuinely closer on the network.
+
+* **Latency is per node, not per RPC.** The estimate is a single value
+  maintained for each node, shared across all RPC types sent to that node.
+  It reflects the node's overall responsiveness rather than the latency of
+  any particular operation, making it a blunt instrument for workloads where
+  different RPCs have meaningfully different latency profiles.
+
+* **Multicast and unicast calls are not measured.** Only calls that receive
+  replies update the latency estimate.  Multicast calls (fire-and-forget) and
+  unicast calls with no response do not contribute measurements, so nodes
+  contacted exclusively via these call types will remain unmeasured.
+
+* **No variance information.** A single average cannot distinguish a stable
+  low-latency node from a high-variance node whose average happens to look good.
+  If jitter matters for your workload, the built-in estimate is not sufficient
+  on its own.
+
+### Best Practices
+
+The limitations above can be mitigated with a few straightforward patterns:
+
+* **Keep traffic flowing.** Latency estimates are only updated when RPCs
+  complete successfully.  If your application has quiet periods, the estimates
+  for idle nodes will become stale.  Scheduling periodic lightweight RPCs
+  (such as a ping or a no-op read) ensures that estimates remain fresh even
+  when there is no organic traffic.
+
+* **Quorum calls contact all nodes.** Latency-based ordering only improves
+  performance when you slice the sorted configuration to a smaller subset.
+  Passing a full-size sorted configuration to a quorum call provides no speedup
+  because every node in the configuration is contacted regardless of order.
+
 ## Interactive REPL
 
 The storage example (`examples/storage`) includes an interactive Read-Eval-Print Loop (REPL) that lets you send RPCs and quorum calls against live storage servers.
@@ -1370,6 +1774,9 @@ When the peer connects, `Config()` starts returning that node as an available ta
 
 The storage example uses `gorums.NewLocalSystems`, which calls `WithConfig` automatically for each system and stores the node list for outbound configuration.
 
+`WithConfig` also accepts an optional `onChange` callback that is called each time the peer configuration changes.
+See [Server Configuration Callbacks](#server-configuration-callbacks) for details and an example.
+
 ### Writing the Handler
 
 Call `ctx.Release()` before making nested outbound calls to release the handler's exclusive lock on the server,
@@ -1475,7 +1882,7 @@ systems, stop, err := gorums.NewLocalSystems(4)
 ### Setting Up the Client
 
 For the server to call back to a client, the client must expose its own method handlers over the same bidirectional stream it opens to the server.
-Create a `*gorums.Server`, register any handler methods the server may invoke, and then call `NewConfig` on that server object to establish the outbound connection:
+Create a `*gorums.Server`, register any handler methods the server may invoke, and then pass it to `WithServer` when establishing the outbound connection:
 
 ```go
 // Create a server to host the client-side handlers.
@@ -1484,14 +1891,15 @@ clientSrv := gorums.NewServer()
 // Register the methods the remote server is allowed to call back on this client.
 clientSrv.RegisterHandler(pb.MyMethod, myHandler)
 
-// Connect to the server; NewConfig wires up the back-channel dispatcher automatically.
-config, err := clientSrv.NewConfig(
+// Connect to the server; WithServer wires up the back-channel dispatcher automatically.
+config, err := gorums.NewConfig(
     gorums.WithNodeList(serverAddrs),
+    gorums.WithServer(clientSrv),
     gorums.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
 )
 ```
 
-Calling `clientSrv.NewConfig` instead of the standalone `gorums.NewConfig` is what installs the server as the back-channel request handler.
+Passing `clientSrv` to `gorums.WithServer` is what installs the server as the back-channel request handler.
 When the remote server dispatches a reverse-direction call via `ctx.ClientConfig()`, the call arrives on the same gRPC stream the client opened and is routed to `clientSrv` for dispatch.
 
 The client does **not** need to open a separate listening socket — the handler is served entirely over the existing outbound connection.
@@ -1500,7 +1908,7 @@ The client does **not** need to open a separate listening socket — the handler
 
 A client must announce `NodeID=0` in its connection metadata to be assigned a dynamic node ID by the server and to appear in `ClientConfig()` for reverse-direction calls.
 Clients behind a firewall typically have no pre-configured node ID, so they connect as anonymous clients.
-Connecting via `clientSrv.NewConfig` without `WithConfig` sends `NodeID=0` automatically.
+Connecting via `gorums.NewConfig(..., gorums.WithServer(clientSrv), ...)` without `WithConfig` sends `NodeID=0` automatically.
 The server assigns it a dynamic ID and includes it in `ClientConfig()`.
 The client can then call `Register` (a unicast) to signal that it is ready to receive calls:
 

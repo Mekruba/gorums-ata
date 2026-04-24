@@ -2,8 +2,6 @@ package gorums
 
 import (
 	"errors"
-
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 // Multicast is a one-way call; no replies are returned to the client.
@@ -21,19 +19,16 @@ import (
 //
 // This method should be used by generated code only.
 func Multicast[Req msg](ctx *ConfigContext, req Req, method string, opts ...CallOption) error {
-	callOpts := getCallOptions(E_Multicast, opts...)
-	waitSendDone := callOpts.mustWaitSendDone()
+	callOpts := getCallOptions(opts...)
+	waitForSend := !callOpts.ignoreErrors
 
-	clientCtx := newClientCtx[Req, *emptypb.Empty](ctx, req, method, clientCtxOptions{
-		waitSendDone: waitSendDone,
-		interceptors: callOpts.interceptors,
-	})
+	clientCtx := newMulticastClientCtx(ctx, req, method, waitForSend, callOpts.interceptors)
 
 	// Send messages immediately (multicast doesn't use lazy sending)
 	clientCtx.sendNow()
 
 	// If waiting for send completion, drain the reply channel and return the first error.
-	if waitSendDone {
+	if waitForSend {
 		var errs []nodeError
 		for range clientCtx.Size() {
 			select {

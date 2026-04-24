@@ -1,7 +1,7 @@
 package main
 
 import (
-	"log"
+	"fmt"
 
 	"github.com/relab/gorums"
 	"github.com/relab/gorums/examples/storage/proto"
@@ -11,15 +11,14 @@ import (
 
 func runClient(addresses []string) error {
 	if len(addresses) < 1 {
-		log.Fatalln("No addresses provided!")
+		return fmt.Errorf("no server addresses provided")
 	}
-	cfg, err := proto.NewConfig(gorums.WithNodeList(addresses),
-		gorums.WithDialOptions(
-			grpc.WithTransportCredentials(insecure.NewCredentials()), // disable TLS
-		),
+	cfg, err := gorums.NewConfig(
+		gorums.WithNodeList(addresses),
+		gorums.WithDialOptions(grpc.WithTransportCredentials(insecure.NewCredentials())),
 	)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer cfg.Close()
 	return Repl(cfg)
@@ -29,7 +28,7 @@ func runClient(addresses []string) error {
 // with the most recent timestamp.
 func newestValue(responses *gorums.Responses[*proto.ReadResponse]) (*proto.ReadResponse, error) {
 	var newest *proto.ReadResponse
-	for resp := range responses.Seq() {
+	for resp := range responses.Results() {
 		if resp.Err != nil {
 			continue
 		}
@@ -48,7 +47,7 @@ func newestValue(responses *gorums.Responses[*proto.ReadResponse]) (*proto.ReadR
 func numUpdated(responses *gorums.Responses[*proto.WriteResponse]) (*proto.WriteResponse, error) {
 	var count int
 	size := responses.Size()
-	for resp := range responses.Seq() {
+	for resp := range responses.Results() {
 		if resp.Err != nil {
 			continue
 		}
