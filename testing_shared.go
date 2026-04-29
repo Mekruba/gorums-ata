@@ -2,6 +2,7 @@ package gorums
 
 import (
 	"context"
+	"crypto"
 	"fmt"
 	"io"
 	"iter"
@@ -25,10 +26,24 @@ type testNode struct {
 
 func (n testNode) Addr() string { return n.addr }
 
+// testNodeWithKey is a testNode that also implements [NodeIdentity], providing
+// a cryptographic public key alongside the address. Use it in tests that verify
+// automatic key distribution via [WithNodes].
+type testNodeWithKey struct {
+	addr string
+	pub  crypto.PublicKey
+}
+
+func (n testNodeWithKey) Addr() string                { return n.addr }
+func (n testNodeWithKey) PublicKey() crypto.PublicKey { return n.pub }
+
 // Compile-time assertions: both node providers satisfy NodeListOption.
 var (
 	_ NodeListOption = nodeMap[testNode](nil)
 	_ NodeListOption = nodeList(nil)
+	// testNodeWithKey satisfies both NodeAddress and NodeIdentity.
+	_ NodeAddress  = testNodeWithKey{}
+	_ NodeIdentity = testNodeWithKey{}
 )
 
 // TestContext creates a context with timeout for testing.

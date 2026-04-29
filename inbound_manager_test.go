@@ -408,7 +408,7 @@ func TestOnConfigChangeCallbackFiringOnConstruction(t *testing.T) {
 		3: {"127.0.0.1:9083"},
 	}), 0, func(cfg Configuration) {
 		calls = append(calls, slices.Clone(cfg.NodeIDs()))
-	}, nil)
+	}, nil, nil)
 
 	if len(calls) != 1 {
 		t.Fatalf("onChange fired %d times during construction; want 1", len(calls))
@@ -429,7 +429,7 @@ func TestOnConfigChangeCallbackPeerConnectDisconnect(t *testing.T) {
 		3: {"127.0.0.1:9083"},
 	}), 0, func(cfg Configuration) {
 		snapshots = append(snapshots, slices.Clone(cfg.NodeIDs()))
-	}, nil)
+	}, nil, nil)
 
 	snapshots = nil // discard the construction snapshot
 
@@ -464,7 +464,7 @@ func TestOnConfigChangeCallbackMultiplePeers(t *testing.T) {
 		3: {"127.0.0.1:9083"},
 	}), 0, func(cfg Configuration) {
 		snapshots = append(snapshots, slices.Clone(cfg.NodeIDs()))
-	}, nil)
+	}, nil, nil)
 
 	snapshots = nil // discard the construction snapshot
 
@@ -505,7 +505,7 @@ func TestOnConfigChangeCallbackIdempotentCleanup(t *testing.T) {
 		2: {"127.0.0.1:9082"},
 	}), 0, func(_ Configuration) {
 		callCount++
-	}, nil)
+	}, nil, nil)
 
 	callCount = 0 // discard the construction call
 

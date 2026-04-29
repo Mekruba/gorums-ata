@@ -204,13 +204,54 @@ func (im *inboundManager) isKnown(id uint32) bool {
 	return ok
 }
 
+// setPublicKey registers a public key for the given node ID. It is called
+// automatically during configuration when nodes implement [NodeIdentity].
+// It does not override a key already registered (e.g. via [WithPeerPublicKeys]).
+func (im *inboundManager) setPublicKey(id uint32, key crypto.PublicKey) {
+	if _, already := im.pubKeys[id]; already {
+		return
+	}
+	if im.pubKeys == nil {
+		im.pubKeys = make(map[uint32]crypto.PublicKey)
+	}
+	im.pubKeys[id] = key
+}
+
+// certPeerID identifies a connecting peer by their TLS certificate's public key.
+// It searches the registered public keys for one matching the peer's certificate
+// and returns the corresponding node ID, or 0 if no match is found.
+// Returns 0 when pubKeys is empty, the connection is not TLS, or no cert is presented.
+func (im *inboundManager) certPeerID(ctx context.Context) uint32 {
+	if len(im.pubKeys) == 0 {
+		return 0
+	}
+	got, err := peerPublicKey(ctx)
+	if err != nil {
+		return 0
+	}
+	for id, expected := range im.pubKeys {
+		if equalPublicKeys(got, expected) {
+			return id
+		}
+	}
+	return 0
+}
+
 // AcceptPeer accepts an inbound stream and returns the associated peer node
 // and a cleanup function. It currently never returns an error, but the signature
 // supports error handling to allow for authenticated peer connections in the future.
 // The returned [stream.PeerNode] is always non-nil, when err is nil.
 //
-// If the stream identifies a known peer, AcceptPeer registers it and returns
-// that peer's node.
+// When public keys are registered (via [WithPeerPublicKeys] or [NodeIdentity]),
+// AcceptPeer first tries to identify the peer by their TLS certificate:
+// the node ID whose registered key matches the cert is used, ignoring the claimed
+// metadata ID. This prevents NodeID spoofing in mTLS deployments.
+//
+// If cert-based identification yields no match, AcceptPeer falls back to the
+// gorums-node-id metadata value. If a public key is registered for that ID,
+// the cert must still match; peers without a matching cert are demoted to
+// anonymous connections.
+//
 // If the stream includes peer metadata with node ID 0, AcceptPeer creates a
 // client peer node with an assigned ID.
 // Otherwise, AcceptPeer returns a nilPeerNode that accepts the connection
@@ -221,17 +262,31 @@ func (im *inboundManager) AcceptPeer(streamCtx context.Context, inboundStream st
 		return &nilPeerNode{stream: inboundStream}, noop, nil
 	}
 	nilNode := &nilPeerNode{stream: inboundStream, handler: im.handler}
+
+	// When public keys are registered and the peer presents a TLS certificate,
+	// identify the peer by cert rather than the claimed NodeID in metadata.
+	// The TLS cert is verified by mTLS, binding the connection to a specific identity.
+	if certID := im.certPeerID(streamCtx); certID != 0 {
+		if im.isKnown(certID) {
+			return im.registerPeer(streamCtx, inboundStream, certID)
+		}
+		// Cert matched a registered key but there is no known node for that ID: reject.
+		return nilNode, noop, nil
+	}
+
+	// Fall back to metadata-based identification (trusted-network or development use,
+	// or for known peers without a registered public key).
 	id := nodeID(streamCtx)
 	if im.isKnown(id) {
-		// Known peer — verify TLS certificate if a public key is registered for this ID.
+		// If a public key is registered for this peer, require a matching TLS cert.
+		// A peer that failed cert-based lookup above but claims a known ID with a
+		// registered key must still present a valid matching certificate.
 		if expected, ok := im.pubKeys[id]; ok {
 			if err := verifyCertForNode(streamCtx, expected); err != nil {
-				// Certificate mismatch: accept the stream as anonymous so the
-				// connection is not dropped, but do not register as a known peer.
+				// Certificate mismatch: accept as anonymous, do not register as known peer.
 				return nilNode, noop, nil
 			}
 		}
-		// Known peer — register on pre-created node.
 		return im.registerPeer(streamCtx, inboundStream, id)
 	}
 	if id != 0 {
@@ -424,5 +479,6 @@ func (p *nilPeerNode) Enqueue(req stream.Request) {
 var (
 	_ stream.PeerAcceptor = (*inboundManager)(nil)
 	_ nodeRegistry        = (*inboundManager)(nil)
+	_ keyRegistrar        = (*inboundManager)(nil)
 	_ stream.PeerNode     = (*nilPeerNode)(nil)
 )

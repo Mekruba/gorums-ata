@@ -1,6 +1,7 @@
 package gorums
 
 import (
+	"crypto"
 	"fmt"
 	"maps"
 	"net"
@@ -25,6 +26,24 @@ type NodeAddress interface {
 	Addr() string
 }
 
+// NodeIdentity extends NodeAddress with a cryptographic public key.
+// When used with [WithNodes], an [inboundManager] automatically registers the
+// public key for each node, enabling certificate-based peer identification
+// without a separate [WithPeerPublicKeys] call.
+// If [WithPeerPublicKeys] also provides a key for the same node ID, the
+// explicitly registered key takes precedence.
+type NodeIdentity interface {
+	NodeAddress
+	PublicKey() crypto.PublicKey
+}
+
+// keyRegistrar is implemented by node registries that support public key
+// registration. It is satisfied by [inboundManager] and used by
+// [NodeIdentity]-aware node providers to distribute keys at configuration time.
+type keyRegistrar interface {
+	setPublicKey(id uint32, key crypto.PublicKey)
+}
+
 // WithNodes returns a NodeListOption containing the provided mapping from
 // application-specific IDs to types implementing NodeAddress.
 // Node IDs must be greater than 0.
@@ -44,6 +63,18 @@ func (nm nodeMap[T]) newConfig(registry nodeRegistry) (Configuration, error) {
 		node := nm[id]
 		if err := builder.add(id, node.Addr()); err != nil {
 			return nil, err
+		}
+	}
+	// If the registry supports public key registration (e.g. inboundManager),
+	// propagate keys from nodes implementing NodeIdentity. Explicitly registered
+	// keys (via WithPeerPublicKeys) are not overwritten.
+	if kr, ok := registry.(keyRegistrar); ok {
+		for id, node := range nm {
+			if ni, ok := any(node).(NodeIdentity); ok {
+				if key := ni.PublicKey(); key != nil {
+					kr.setPublicKey(id, key)
+				}
+			}
 		}
 	}
 	return builder.configuration(), nil

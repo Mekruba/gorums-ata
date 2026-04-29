@@ -39,7 +39,7 @@ func newTestSignable(value string, signerID uint32) *testSignable {
 	return &testSignable{StringValue: pb.String(value), signerID: signerID}
 }
 
-func (t *testSignable) GetSignerID() uint32  { return t.signerID }
+func (t *testSignable) GetSignerID() uint32   { return t.signerID }
 func (t *testSignable) GetSignature() []byte  { return t.sig }
 func (t *testSignable) SetSignature(s []byte) { t.sig = s }
 
@@ -555,5 +555,188 @@ func TestSecurityNewVerifyingInterceptor(t *testing.T) {
 				t.Errorf("interceptor() code = %v; want %v", got, tc.wantCode)
 			}
 		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// TestCertPeerID
+// -----------------------------------------------------------------------------
+
+// TestSecurityCertPeerID verifies that certPeerID resolves a peer's node ID
+// by matching the TLS certificate's public key against registered keys,
+// and returns 0 when no match is possible.
+func TestSecurityCertPeerID(t *testing.T) {
+	pub1, priv1 := generateTestKeyPair(t)
+	pub2, priv2 := generateTestKeyPair(t)
+	pub3, priv3 := generateTestKeyPair(t)
+	cert1 := generateTestCert(t, pub1, priv1)
+	cert2 := generateTestCert(t, pub2, priv2)
+	cert3 := generateTestCert(t, pub3, priv3) // not registered
+
+	im := newInboundManager(99, WithNodes(map[uint32]testNode{
+		1: {"127.0.0.1:9081"},
+		2: {"127.0.0.1:9082"},
+	}), 0, nil, nil, map[uint32]crypto.PublicKey{
+		1: pub1,
+		2: pub2,
+	})
+
+	tests := []struct {
+		name   string
+		ctx    context.Context
+		wantID uint32
+	}{
+		{name: "Cert1MatchesNode1", ctx: tlsPeerCtx(context.Background(), cert1), wantID: 1},
+		{name: "Cert2MatchesNode2", ctx: tlsPeerCtx(context.Background(), cert2), wantID: 2},
+		{name: "UnknownCert", ctx: tlsPeerCtx(context.Background(), cert3), wantID: 0},
+		{name: "NoCert", ctx: noPeerCtx(context.Background()), wantID: 0},
+		{name: "NoTLS", ctx: context.Background(), wantID: 0},
+		{name: "NoPubKeysRegistered", ctx: tlsPeerCtx(context.Background(), cert1), wantID: 0},
+	}
+
+	// Re-run the last case on a manager with no registered keys.
+	emptyIM := newInboundManager(99, WithNodes(map[uint32]testNode{
+		1: {"127.0.0.1:9081"},
+	}), 0, nil, nil, nil)
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr := im
+			if i == len(tests)-1 {
+				mgr = emptyIM
+			}
+			got := mgr.certPeerID(tc.ctx)
+			if got != tc.wantID {
+				t.Errorf("certPeerID() = %d; want %d", got, tc.wantID)
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// TestNodeIdentityAutoKeyRegistration
+// -----------------------------------------------------------------------------
+
+// TestSecurityNodeIdentityAutoKeyRegistration verifies that inboundManager
+// automatically registers public keys from nodes implementing NodeIdentity,
+// and that cert-based peer identification works without an explicit
+// WithPeerPublicKeys call.
+func TestSecurityNodeIdentityAutoKeyRegistration(t *testing.T) {
+	pub1, priv1 := generateTestKeyPair(t)
+	pub2, priv2 := generateTestKeyPair(t)
+	cert1 := generateTestCert(t, pub1, priv1)
+	cert2 := generateTestCert(t, pub2, priv2)
+
+	// Use testNodeWithKey (NodeIdentity) instead of testNode; no explicit pubKeys arg.
+	im := newInboundManager(99, WithNodes(map[uint32]testNodeWithKey{
+		1: {"127.0.0.1:9081", pub1},
+		2: {"127.0.0.1:9082", pub2},
+	}), 0, nil, nil, nil)
+
+	tests := []struct {
+		name         string
+		streamCtx    context.Context
+		wantID       uint32 // node ID expected in Config
+		wantInConfig bool
+	}{
+		{
+			// Correct cert for node 1 → cert-based ID resolves to node 1.
+			name:         "Node1CorrectCert",
+			streamCtx:    inboundCtxWithTLS(t.Context(), 1, cert1),
+			wantID:       1,
+			wantInConfig: true,
+		},
+		{
+			// Peer presents node 2's cert but claims to be node 1 (spoofing attempt).
+			// cert-based ID resolves to node 2 (cert matches pub2); metadata claim ignored.
+			name:         "SpoofedMetadataNode1UsesCert2",
+			streamCtx:    inboundCtxWithTLS(t.Context(), 1, cert2),
+			wantID:       2,
+			wantInConfig: true,
+		},
+		{
+			// No TLS cert; falls back to metadata ID (node 1) but key is registered
+			// for node 1 so cert is required → rejected.
+			name:         "NoCertRegisteredKeyRejected",
+			streamCtx:    inboundCtx(t.Context(), 1),
+			wantID:       1,
+			wantInConfig: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ms := newMockBidiStream()
+			defer ms.close()
+
+			_, cleanup, err := im.AcceptPeer(tc.streamCtx, ms)
+			if err != nil {
+				t.Fatalf("AcceptPeer() error = %v", err)
+			}
+			defer cleanup()
+
+			inCfg := false
+			for _, n := range im.Config() {
+				if n.ID() == tc.wantID {
+					inCfg = true
+					break
+				}
+			}
+			if inCfg != tc.wantInConfig {
+				t.Errorf("node %d in Config = %v; want %v", tc.wantID, inCfg, tc.wantInConfig)
+			}
+		})
+	}
+}
+
+// TestSecurityNodeIdentityExplicitKeyWins verifies that an explicitly registered
+// key via WithPeerPublicKeys takes precedence over one derived from NodeIdentity.
+func TestSecurityNodeIdentityExplicitKeyWins(t *testing.T) {
+	pubIdentity, privIdentity := generateTestKeyPair(t)
+	pubExplicit, privExplicit := generateTestKeyPair(t)
+	certIdentity := generateTestCert(t, pubIdentity, privIdentity)
+	certExplicit := generateTestCert(t, pubExplicit, privExplicit)
+
+	// NodeIdentity provides pubIdentity for node 1, but WithPeerPublicKeys
+	// explicitly registers pubExplicit for the same node. Explicit wins.
+	im := newInboundManager(99, WithNodes(map[uint32]testNodeWithKey{
+		1: {"127.0.0.1:9081", pubIdentity},
+	}), 0, nil, nil, map[uint32]crypto.PublicKey{
+		1: pubExplicit,
+	})
+
+	ms := newMockBidiStream()
+	defer ms.close()
+
+	// certIdentity (from NodeIdentity) should NOT be recognized — explicit key overrides.
+	_, cleanupIdentity, err := im.AcceptPeer(inboundCtxWithTLS(t.Context(), 1, certIdentity), ms)
+	if err != nil {
+		t.Fatalf("AcceptPeer() error = %v", err)
+	}
+	defer cleanupIdentity()
+	for _, n := range im.Config() {
+		if n.ID() == 1 {
+			t.Error("node 1 in Config with NodeIdentity cert; explicit key should take precedence")
+		}
+	}
+
+	ms2 := newMockBidiStream()
+	defer ms2.close()
+
+	// certExplicit (explicitly registered key) should be recognized.
+	_, cleanupExplicit, err := im.AcceptPeer(inboundCtxWithTLS(t.Context(), 1, certExplicit), ms2)
+	if err != nil {
+		t.Fatalf("AcceptPeer() error = %v", err)
+	}
+	defer cleanupExplicit()
+	found := false
+	for _, n := range im.Config() {
+		if n.ID() == 1 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("node 1 not in Config after connecting with explicitly registered cert")
 	}
 }
