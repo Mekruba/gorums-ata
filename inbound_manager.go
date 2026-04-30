@@ -79,8 +79,9 @@ type inboundManager struct {
 	handler        stream.RequestHandler       // handler for dispatching incoming requests on all inbound nodes
 	onConfigChange func(Configuration)         // optional; called after each known-peer config change
 	nextClientID   uint32                      // next ID to assign to a client peer
-	pubKeys        map[uint32]crypto.PublicKey // expected TLS public key per known peer node ID; nil means no cert verification
-	configCh       chan struct{}               // closed and replaced on each config/clientConfig change; protected by mu
+	pubKeys         map[uint32]crypto.PublicKey // expected TLS public key per known peer node ID; nil means no cert verification
+	tlsPeerIdentity bool                        // when true, derive peer NodeID from cert CN/SAN (WithTLSPeerIdentity)
+	configCh        chan struct{}               // closed and replaced on each config/clientConfig change; protected by mu
 	stopCh         chan struct{}               // closed on shutdown to unblock waiters; never replaced
 	stopOnce       sync.Once                   // ensures stopCh is closed exactly once
 }
@@ -100,17 +101,18 @@ const clientIDStart = 1 << 20
 // installed on the self-node (if present) to enable in-process dispatch without
 // a network round-trip. Panics on configuration errors (invalid addresses,
 // duplicate nodes, etc.)
-func newInboundManager(myID uint32, opt NodeListOption, sendBuffer uint, onConfigChange func(Configuration), handler stream.RequestHandler, pubKeys map[uint32]crypto.PublicKey) *inboundManager {
+func newInboundManager(myID uint32, opt NodeListOption, sendBuffer uint, onConfigChange func(Configuration), handler stream.RequestHandler, pubKeys map[uint32]crypto.PublicKey, tlsPeerIdentity bool) *inboundManager {
 	im := &inboundManager{
-		myID:           myID,
-		nodes:          make(map[uint32]*Node),
-		sendBufferSize: sendBuffer,
-		handler:        handler,
-		onConfigChange: onConfigChange,
-		nextClientID:   clientIDStart,
-		pubKeys:        pubKeys,
-		configCh:       make(chan struct{}),
-		stopCh:         make(chan struct{}),
+		myID:            myID,
+		nodes:           make(map[uint32]*Node),
+		sendBufferSize:  sendBuffer,
+		handler:         handler,
+		onConfigChange:  onConfigChange,
+		nextClientID:    clientIDStart,
+		pubKeys:         pubKeys,
+		tlsPeerIdentity: tlsPeerIdentity,
+		configCh:        make(chan struct{}),
+		stopCh:          make(chan struct{}),
 	}
 	if opt != nil {
 		if _, err := opt.newConfig(im); err != nil {
@@ -262,6 +264,26 @@ func (im *inboundManager) AcceptPeer(streamCtx context.Context, inboundStream st
 		return &nilPeerNode{stream: inboundStream}, noop, nil
 	}
 	nilNode := &nilPeerNode{stream: inboundStream, handler: im.handler}
+
+	// PKI-native path: when WithTLSPeerIdentity is enabled, derive the peer's
+	// NodeID directly from the cert's URI SAN or CN. The CA has already verified
+	// the certificate during the TLS handshake, so the encoded NodeID cannot be
+	// spoofed via metadata. This is the preferred path for production deployments.
+	if im.tlsPeerIdentity {
+		if certID := identifyPeerFromCert(streamCtx); certID != 0 {
+			if im.isKnown(certID) {
+				return im.registerPeer(streamCtx, inboundStream, certID)
+			}
+			// Cert encodes a valid NodeID but it is not in the known set: reject.
+			return nilNode, noop, nil
+		}
+		// No gorums identity in the cert: cannot register as a known peer.
+		// Handle client-peer (gorums-node-id: 0) and anonymous connections only.
+		if !hasPeerMetadata(streamCtx) {
+			return nilNode, noop, nil
+		}
+		return im.acceptClient(streamCtx, inboundStream)
+	}
 
 	// When public keys are registered and the peer presents a TLS certificate,
 	// identify the peer by cert rather than the claimed NodeID in metadata.

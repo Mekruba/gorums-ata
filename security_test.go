@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"math/big"
+	"net/url"
 	"testing"
 	"time"
 
@@ -65,6 +66,60 @@ func generateTestCert(t *testing.T, pub ed25519.PublicKey, priv ed25519.PrivateK
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("x509.ParseCertificate: %v", err)
+	}
+	return cert
+}
+
+// generateTestCertWithCN creates a self-signed certificate with the given Common Name.
+func generateTestCertWithCN(t *testing.T, pub ed25519.PublicKey, priv ed25519.PrivateKey, cn string) *x509.Certificate {
+	t.Helper()
+	sn, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("rand.Int: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: sn,
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+	tmpl.Subject.CommonName = cn
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
+	if err != nil {
+		t.Fatalf("x509.CreateCertificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("x509.ParseCertificate: %v", err)
+	}
+	return cert
+}
+
+// generateTestCertWithURISAN creates a self-signed certificate with the given URI SAN.
+func generateTestCertWithURISAN(t *testing.T, pub ed25519.PublicKey, priv ed25519.PrivateKey, rawURI string) *x509.Certificate {
+	t.Helper()
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		t.Fatalf("url.Parse(%q): %v", rawURI, err)
+	}
+	sn, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("rand.Int: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: sn,
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		URIs:         []*url.URL{u},
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
 	if err != nil {
@@ -260,7 +315,7 @@ func TestSecurityAcceptPeerCertVerification(t *testing.T) {
 		3: {"127.0.0.1:9083"},
 	}), 0, nil, nil, map[uint32]crypto.PublicKey{
 		1: pub1,
-	})
+	}, false)
 
 	s := newMockBidiStream()
 	defer s.close()
@@ -374,7 +429,7 @@ func TestSecurityWithPeerPublicKeys(t *testing.T) {
 	im := newInboundManager(99, WithNodes(map[uint32]testNode{
 		1: {"127.0.0.1:9081"},
 		2: {"127.0.0.1:9082"},
-	}), 0, nil, nil, peerKeys)
+	}), 0, nil, nil, peerKeys, false)
 
 	ms := newMockBidiStream()
 	defer ms.close()
@@ -579,7 +634,7 @@ func TestSecurityCertPeerID(t *testing.T) {
 	}), 0, nil, nil, map[uint32]crypto.PublicKey{
 		1: pub1,
 		2: pub2,
-	})
+	}, false)
 
 	tests := []struct {
 		name   string
@@ -597,7 +652,7 @@ func TestSecurityCertPeerID(t *testing.T) {
 	// Re-run the last case on a manager with no registered keys.
 	emptyIM := newInboundManager(99, WithNodes(map[uint32]testNode{
 		1: {"127.0.0.1:9081"},
-	}), 0, nil, nil, nil)
+	}), 0, nil, nil, nil, false)
 
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -631,7 +686,7 @@ func TestSecurityNodeIdentityAutoKeyRegistration(t *testing.T) {
 	im := newInboundManager(99, WithNodes(map[uint32]testNodeWithKey{
 		1: {"127.0.0.1:9081", pub1},
 		2: {"127.0.0.1:9082", pub2},
-	}), 0, nil, nil, nil)
+	}), 0, nil, nil, nil, false)
 
 	tests := []struct {
 		name         string
@@ -703,7 +758,7 @@ func TestSecurityNodeIdentityExplicitKeyWins(t *testing.T) {
 		1: {"127.0.0.1:9081", pubIdentity},
 	}), 0, nil, nil, map[uint32]crypto.PublicKey{
 		1: pubExplicit,
-	})
+	}, false)
 
 	ms := newMockBidiStream()
 	defer ms.close()
@@ -738,5 +793,210 @@ func TestSecurityNodeIdentityExplicitKeyWins(t *testing.T) {
 	}
 	if !found {
 		t.Error("node 1 not in Config after connecting with explicitly registered cert")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// TestNodeIDFromCert
+// -----------------------------------------------------------------------------
+
+// TestSecurityNodeIDFromCert verifies that nodeIDFromCert correctly extracts
+// a gorums NodeID from a certificate's URI SAN or Common Name.
+func TestSecurityNodeIDFromCert(t *testing.T) {
+	pub, priv := generateTestKeyPair(t)
+
+	tests := []struct {
+		name   string
+		cert   *x509.Certificate
+		wantID uint32
+	}{
+		{
+			name:   "URISAN",
+			cert:   generateTestCertWithURISAN(t, pub, priv, "gorums://node/42"),
+			wantID: 42,
+		},
+		{
+			name:   "CommonName",
+			cert:   generateTestCertWithCN(t, pub, priv, "gorums-node-7"),
+			wantID: 7,
+		},
+		{
+			// URI SAN takes priority over CN when both are present.
+			name: "URISANPriorityOverCN",
+			cert: func() *x509.Certificate {
+				u, _ := url.Parse("gorums://node/5")
+				sn, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+				tmpl := &x509.Certificate{
+					SerialNumber: sn,
+					NotBefore:    time.Now().Add(-time.Hour),
+					NotAfter:     time.Now().Add(time.Hour),
+					KeyUsage:     x509.KeyUsageDigitalSignature,
+					URIs:         []*url.URL{u},
+				}
+				tmpl.Subject.CommonName = "gorums-node-99"
+				der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
+				cert, _ := x509.ParseCertificate(der)
+				return cert
+			}(),
+			wantID: 5,
+		},
+		{
+			name:   "NoIdentity",
+			cert:   generateTestCert(t, pub, priv),
+			wantID: 0,
+		},
+		{
+			name:   "CNWrongPrefix",
+			cert:   generateTestCertWithCN(t, pub, priv, "node-42"),
+			wantID: 0,
+		},
+		{
+			name:   "URISANWrongScheme",
+			cert:   generateTestCertWithURISAN(t, pub, priv, "https://node/42"),
+			wantID: 0,
+		},
+		{
+			name:   "URISANZeroIDReserved",
+			cert:   generateTestCertWithURISAN(t, pub, priv, "gorums://node/0"),
+			wantID: 0,
+		},
+		{
+			name:   "CNZeroIDReserved",
+			cert:   generateTestCertWithCN(t, pub, priv, "gorums-node-0"),
+			wantID: 0,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := nodeIDFromCert(tc.cert)
+			if got != tc.wantID {
+				t.Errorf("nodeIDFromCert() = %d; want %d", got, tc.wantID)
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// TestIdentifyPeerFromCert
+// -----------------------------------------------------------------------------
+
+// TestSecurityIdentifyPeerFromCert verifies that identifyPeerFromCert correctly
+// extracts a gorums NodeID from the TLS peer certificate in a context.
+func TestSecurityIdentifyPeerFromCert(t *testing.T) {
+	pub, priv := generateTestKeyPair(t)
+	certWithSAN := generateTestCertWithURISAN(t, pub, priv, "gorums://node/3")
+	certWithCN := generateTestCertWithCN(t, pub, priv, "gorums-node-5")
+	certNoID := generateTestCert(t, pub, priv)
+
+	tests := []struct {
+		name   string
+		ctx    context.Context
+		wantID uint32
+	}{
+		{name: "URISANInCert", ctx: tlsPeerCtx(context.Background(), certWithSAN), wantID: 3},
+		{name: "CNInCert", ctx: tlsPeerCtx(context.Background(), certWithCN), wantID: 5},
+		{name: "CertNoIdentity", ctx: tlsPeerCtx(context.Background(), certNoID), wantID: 0},
+		{name: "NoCert", ctx: noPeerCtx(context.Background()), wantID: 0},
+		{name: "NoTLS", ctx: context.Background(), wantID: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := identifyPeerFromCert(tc.ctx)
+			if got != tc.wantID {
+				t.Errorf("identifyPeerFromCert() = %d; want %d", got, tc.wantID)
+			}
+		})
+	}
+}
+
+// -----------------------------------------------------------------------------
+// TestAcceptPeerWithTLSPeerIdentity
+// -----------------------------------------------------------------------------
+
+// TestSecurityAcceptPeerTLSPeerIdentity verifies that AcceptPeer with
+// WithTLSPeerIdentity uses the cert CN/SAN as the authoritative peer identity,
+// ignores metadata claims, and handles unknown and identity-free certs correctly.
+func TestSecurityAcceptPeerTLSPeerIdentity(t *testing.T) {
+	pub1, priv1 := generateTestKeyPair(t)
+	pub2, priv2 := generateTestKeyPair(t)
+	pub3, priv3 := generateTestKeyPair(t)
+
+	certNode1 := generateTestCertWithURISAN(t, pub1, priv1, "gorums://node/1")
+	certNode2 := generateTestCertWithCN(t, pub2, priv2, "gorums-node-2")
+	certNoID := generateTestCert(t, pub3, priv3) // no gorums identity in cert
+	certUnknown := generateTestCertWithURISAN(t, pub1, priv1, "gorums://node/99")
+
+	// myID=10 so nodes 1, 2 are peers (not the self-node).
+	// No pubKeys registered: identity comes entirely from the cert.
+	im := newInboundManager(10, WithNodes(map[uint32]testNode{
+		1:  {"127.0.0.1:9081"},
+		2:  {"127.0.0.1:9082"},
+		10: {"127.0.0.1:9090"},
+	}), 0, nil, nil, nil, true) // tlsPeerIdentity = true
+
+	tests := []struct {
+		name         string
+		streamCtx    context.Context
+		wantID       uint32
+		wantInConfig bool
+	}{
+		{
+			name:         "KnownPeerViaURISAN",
+			streamCtx:    tlsPeerCtx(t.Context(), certNode1),
+			wantID:       1,
+			wantInConfig: true,
+		},
+		{
+			name:         "KnownPeerViaCN",
+			streamCtx:    tlsPeerCtx(t.Context(), certNode2),
+			wantID:       2,
+			wantInConfig: true,
+		},
+		{
+			// Metadata claims node 1 but the cert says node 2:
+			// cert-based identity (node 2) overrides the metadata claim.
+			name:         "CertIDOverridesMetadataClaim",
+			streamCtx:    inboundCtxWithTLS(t.Context(), 1, certNode2),
+			wantID:       2,
+			wantInConfig: true,
+		},
+		{
+			// Cert encodes NodeID 99 which is not in the known set: reject.
+			name:         "UnknownNodeIDInCert",
+			streamCtx:    tlsPeerCtx(t.Context(), certUnknown),
+			wantID:       99,
+			wantInConfig: false,
+		},
+		{
+			// Cert carries no gorums identity: treated as anonymous client.
+			name:         "NoCertIdentityAnonymous",
+			streamCtx:    tlsPeerCtx(t.Context(), certNoID),
+			wantID:       0,
+			wantInConfig: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ms := newMockBidiStream()
+			defer ms.close()
+
+			_, cleanup, err := im.AcceptPeer(tc.streamCtx, ms)
+			if err != nil {
+				t.Fatalf("AcceptPeer() error = %v", err)
+			}
+			defer cleanup()
+
+			inCfg := false
+			for _, n := range im.Config() {
+				if n.ID() == tc.wantID {
+					inCfg = true
+					break
+				}
+			}
+			if inCfg != tc.wantInConfig {
+				t.Errorf("node %d in Config = %v; want %v", tc.wantID, inCfg, tc.wantInConfig)
+			}
+		})
 	}
 }

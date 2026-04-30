@@ -62,7 +62,7 @@ func newTestInboundManager(t *testing.T, myID uint32) *inboundManager {
 		1: {"127.0.0.1:9081"},
 		2: {"127.0.0.1:9082"},
 		3: {"127.0.0.1:9083"},
-	}), 0, nil, nil, nil)
+	}), 0, nil, nil, nil, false)
 	return im
 }
 
@@ -129,11 +129,11 @@ func TestNewInboundManager(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.wantPanic != "" {
 				shouldPanic(t, tc.wantPanic, func() {
-					newInboundManager(1, tc.opt, 0, nil, nil, nil)
+					newInboundManager(1, tc.opt, 0, nil, nil, nil, false)
 				})
 				return
 			}
-			im := newInboundManager(1, tc.opt, 0, nil, nil, nil)
+			im := newInboundManager(1, tc.opt, 0, nil, nil, nil, false)
 			nodes := im.Nodes()
 			if len(nodes) != len(tc.wantIDs) {
 				t.Fatalf("len(im.Nodes()) = %d; want %d", len(nodes), len(tc.wantIDs))
@@ -408,7 +408,7 @@ func TestOnConfigChangeCallbackFiringOnConstruction(t *testing.T) {
 		3: {"127.0.0.1:9083"},
 	}), 0, func(cfg Configuration) {
 		calls = append(calls, slices.Clone(cfg.NodeIDs()))
-	}, nil, nil)
+	}, nil, nil, false)
 
 	if len(calls) != 1 {
 		t.Fatalf("onChange fired %d times during construction; want 1", len(calls))
@@ -429,7 +429,7 @@ func TestOnConfigChangeCallbackPeerConnectDisconnect(t *testing.T) {
 		3: {"127.0.0.1:9083"},
 	}), 0, func(cfg Configuration) {
 		snapshots = append(snapshots, slices.Clone(cfg.NodeIDs()))
-	}, nil, nil)
+	}, nil, nil, false)
 
 	snapshots = nil // discard the construction snapshot
 
@@ -464,7 +464,7 @@ func TestOnConfigChangeCallbackMultiplePeers(t *testing.T) {
 		3: {"127.0.0.1:9083"},
 	}), 0, func(cfg Configuration) {
 		snapshots = append(snapshots, slices.Clone(cfg.NodeIDs()))
-	}, nil, nil)
+	}, nil, nil, false)
 
 	snapshots = nil // discard the construction snapshot
 
@@ -505,7 +505,7 @@ func TestOnConfigChangeCallbackIdempotentCleanup(t *testing.T) {
 		2: {"127.0.0.1:9082"},
 	}), 0, func(_ Configuration) {
 		callCount++
-	}, nil, nil)
+	}, nil, nil, false)
 
 	callCount = 0 // discard the construction call
 

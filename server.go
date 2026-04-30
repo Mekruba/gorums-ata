@@ -22,7 +22,8 @@ type serverOptions struct {
 	myID           uint32
 	peerOpt        NodeListOption
 	onConfigChange func(Configuration)
-	peerPubKeys    map[uint32]crypto.PublicKey // optional; see WithPeerPublicKeys
+	peerPubKeys     map[uint32]crypto.PublicKey // optional; see WithPeerPublicKeys
+	tlsPeerIdentity bool                        // optional; see WithTLSPeerIdentity
 }
 
 // ServerOption is used to change settings for the GorumsServer
@@ -130,6 +131,7 @@ func NewServer(opts ...ServerOption) *Server {
 		serverOpts.onConfigChange,
 		s,
 		serverOpts.peerPubKeys,
+		serverOpts.tlsPeerIdentity,
 	)
 	s.srv = stream.NewServer(serverOpts.recvBufferSize, serverOpts.connectCallback, s.inboundManager)
 	stream.RegisterGorumsServer(s.grpcServer, s.srv)

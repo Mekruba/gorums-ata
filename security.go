@@ -8,6 +8,8 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 
 	"google.golang.org/grpc"
@@ -177,4 +179,75 @@ func equalPublicKeys(a, b crypto.PublicKey) bool {
 	}
 	// Fallback: compare as interface values (works for identical byte slices).
 	return a == b
+}
+
+// gorumsURIScheme, gorumsURIHost, and gorumsCNPrefix define the two formats
+// used to encode a gorums NodeID into an X.509 certificate for PKI-native peer
+// identity. The URI SAN format "gorums://node/<id>" is preferred; the CN format
+// "gorums-node-<id>" is supported as a fallback for environments where URI SANs
+// cannot be added to certificates.
+const (
+	gorumsURIScheme = "gorums"
+	gorumsURIHost   = "node"
+	gorumsCNPrefix  = "gorums-node-"
+)
+
+// nodeIDFromCert extracts a gorums NodeID from a certificate's URI SAN or
+// Subject Common Name. URI SANs of the form "gorums://node/<id>" are tried
+// first; the CN "gorums-node-<id>" is tried as a fallback. Returns 0 if no
+// valid gorums NodeID is found or if the encoded ID is 0 (reserved).
+func nodeIDFromCert(cert *x509.Certificate) uint32 {
+	// URI SANs are preferred (standards-compliant, does not pollute the CN).
+	for _, u := range cert.URIs {
+		if u.Scheme == gorumsURIScheme && u.Host == gorumsURIHost {
+			id, err := strconv.ParseUint(strings.TrimPrefix(u.Path, "/"), 10, 32)
+			if err == nil && id > 0 {
+				return uint32(id)
+			}
+		}
+	}
+	// Fall back to Common Name.
+	if strings.HasPrefix(cert.Subject.CommonName, gorumsCNPrefix) {
+		id, err := strconv.ParseUint(cert.Subject.CommonName[len(gorumsCNPrefix):], 10, 32)
+		if err == nil && id > 0 {
+			return uint32(id)
+		}
+	}
+	return 0
+}
+
+// identifyPeerFromCert extracts the gorums NodeID from the TLS client
+// certificate in ctx. Returns 0 if the context carries no TLS peer info,
+// no client certificate was presented, or the certificate carries no gorums
+// identity (see [nodeIDFromCert]).
+func identifyPeerFromCert(ctx context.Context) uint32 {
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return 0
+	}
+	tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo)
+	if !ok {
+		return 0
+	}
+	if len(tlsInfo.State.PeerCertificates) == 0 {
+		return 0
+	}
+	return nodeIDFromCert(tlsInfo.State.PeerCertificates[0])
+}
+
+// WithTLSPeerIdentity configures the server to derive each connecting peer's
+// NodeID from its verified TLS certificate rather than from the gorums-node-id
+// metadata key. The NodeID is read from a URI SAN ("gorums://node/<id>") or,
+// as a fallback, from the Subject Common Name ("gorums-node-<id>"). This
+// delegates identity entirely to the PKI: any peer whose certificate encodes a
+// known NodeID and was signed by the trusted CA is accepted as that peer
+// without an additional key map.
+//
+// This option requires mTLS (see [WithMutualTLS]). Peers whose certificate
+// carries no gorums identity are accepted as anonymous connections and
+// excluded from [ServerCtx.Config].
+func WithTLSPeerIdentity() ServerOption {
+	return func(o *serverOptions) {
+		o.tlsPeerIdentity = true
+	}
 }
